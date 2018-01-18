@@ -28,7 +28,7 @@
 
   (defmacro get-lock (lock &body body)
     `(bt:with-lock-held (,lock)
-       ,@body))
+                        ,@body))
 
   ;; Create these files
   ;; File creation..
@@ -101,10 +101,10 @@
   (defun get-inc-unq-id ()
     "Lock the database unique-id"
     (get-lock *id-lock*
-      (progn
-        (get-unq-id)
-        (put-unq-id (1+ *unique-id*))
-        *unique-id*)))
+              (progn
+                (get-unq-id)
+                (put-unq-id (1+ *unique-id*))
+                *unique-id*)))
 
   #+5am(in-suite database)
   #+5am(test database-unique-id ()
@@ -126,11 +126,11 @@
 
   (defun save-db ()
     (get-lock *write-lock*
-      (cl-store:store *database* *filename*)))
+              (cl-store:store *database* *filename*)))
 
   (defun load-db ()
     (get-lock *read-lock*
-      (setf *database* (cl-store:restore *filename*))))
+              (setf *database* (cl-store:restore *filename*))))
 
   (get-unq-id)
 
