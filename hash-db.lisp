@@ -34,16 +34,6 @@
   (make-pathname :directory '(:relative "db") :name "database" :type "db"))
 (defvar *u-id* (make-pathname :directory '(:relative "db") :name "unq" :type "id"))
 
-#+5am(in-suite database)
-#+5am(test database-in-out ()
-           (setf *database* nil)
-           (setf *class-check* nil)
-           (setf *database* (make-hash:make-hash :test #'equal))
-           (dotimes (i 450) (setf (gethash i *database*) i))
-           (is (= (gethash 0 *database*) 0))
-           (is (= (gethash 449 *database*) 449))
-           (setf *database* nil))
-
 ;; When implementing a class check, make sure you have the class defined.
 ;; and a <CLASS-NAME>-P typep method
 ;;ie (defun <CLASS-NAME>-p (inst) (typep inst '<CLASS-NAME>))
@@ -55,17 +45,6 @@
            (setf str-or-sym (symbol-name *database-class*))))
     (funcall (intern (concatenate 'string str-or-sym "-P")) inst)))
 
-#+5am(in-suite database)
-#+5am(test database-class-check-test ()
-           (defclass testt () (( name :initform "testt")))
-           (defmethod testt-p (inst) (typep inst 'testt))
-           (let ((a (make-instance 'testt)))
-             (setf *class-check* t)
-             (setf *database-class* 'testt)
-             (is (!null (class-check a))))
-           (setf *class-check* nil)
-           (clear-database))
-
 (defun ensure-gethash-local (id inst)
   (if *class-check*
       (cond ((and (class-check inst) (!null id) (numberp id))
@@ -76,10 +55,6 @@
                          *database-class*))))
       (if (and (numberp id) (!null id))
           (ensure-gethash id *database* inst))))
-
-#+5am(in-suite database)
-#+5am(test database-ensure-test ()
-           ())
 
 (defun get-unq-id ()
   (with-input-from-file
@@ -104,21 +79,6 @@
               (put-unq-id (1+ *unique-id*))
               *unique-id*)))
 
-#+5am(in-suite database)
-#+5am(test database-unique-id ()
-           (is (= (put-unq-id 0) 0))
-           (is (= (get-inc-unq-id) 1))
-           (is (= (get-unq-id) 1))
-           (put-unq-id 0)
-           (loop repeat 2 do
-                 (bt:make-thread (lambda ()
-                                   (loop repeat 3 do (get-inc-unq-id))))
-                 (bt:make-thread (lambda ()
-                                   (loop repeat 3 do (get-inc-unq-id))
-                                   (loop repeat 3 do (get-inc-unq-id)))))
-           (sleep 1)
-           (is (= (get-unq-id) 18)))
-
 (defun get-by-key (key)
   (gethash key *database*))
 
@@ -131,7 +91,3 @@
             (setf *database* (cl-store:restore *filename*))))
 
 (get-unq-id)
-
-#+5am(defun clear-database ()
-       (setf *database* nil)
-       (setf *database* (make-hash:make-hash :test #'equal))) ; eval-now end

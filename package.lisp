@@ -10,4 +10,12 @@
     #:cl
     #:bordeaux-threads
     #:cl-store
-    #:alexandria))
+    #:alexandria)
+  (:export #:get-inc-unq-id
+           #:get-by-key
+           #:get-lock
+           #:get-database
+           #:ensure-gethash-local
+           #:*write-lock*
+           #:*read-lock*
+           #:*id-lock*))
