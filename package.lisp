@@ -18,4 +18,7 @@
            #:ensure-gethash-local
            #:*write-lock*
            #:*read-lock*
-           #:*id-lock*))
+           #:*id-lock*
+           #:*class-check*
+           #:*database-class*
+           ))

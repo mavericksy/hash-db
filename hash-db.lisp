@@ -1,7 +1,7 @@
 (in-package #:hash-db)
 ;;;; Simple hash table DB
 ;;;; Flat file with unique integer ids.
-;;;; depends on cl-store ,BT and make-hash & fiveam for the tests
+;;;; depends on cl-store ,BT and make-hash
 ;;;; v.1
 ;;;; TODO implement relational framework across multiple hash-tables and object
 ;;;; mapping
@@ -38,6 +38,7 @@
 ;; and a <CLASS-NAME>-P typep method
 ;;ie (defun <CLASS-NAME>-p (inst) (typep inst '<CLASS-NAME>))
 (defun class-check (inst)
+  (declare (string str-or-sym))
   (let ((str-or-sym))
     (cond ((stringp *database-class*)
            (setf str-or-sym (string-upcase *database-class*)))
@@ -46,6 +47,8 @@
     (funcall (intern (concatenate 'string str-or-sym "-P")) inst)))
 
 (defun ensure-gethash-local (id inst)
+  (declare (fixnum id))
+  (declare (optimize (speed 3) (safety 0)))
   (if *class-check*
       (cond ((and (class-check inst) (!null id) (numberp id))
              (ensure-gethash id *database* inst))
@@ -64,6 +67,7 @@
       *unique-id*)))
 
 (defun put-unq-id (c)
+  (declare (fixnum c))
   (with-output-to-file
     (out *u-id*
          :if-exists :supersede)
