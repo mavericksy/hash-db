@@ -57,7 +57,8 @@
                          "Instance must be of ~A and a fixnum id."
                          *database-class*))))
       (if (and (numberp id) (!null id))
-          (ensure-gethash id *database* inst))))
+          (ensure-gethash id *database* inst)))
+  (save-db))
 
 (defun get-unq-id ()
   (with-input-from-file
@@ -77,11 +78,12 @@
 
 (defun get-inc-unq-id ()
   "Lock the database unique-id"
+  (declare (fixnum *unique-id*))
   (get-lock *id-lock*
             (progn
               (get-unq-id)
-              (put-unq-id (1+ *unique-id*))
-              *unique-id*)))
+              (put-unq-id (the fixnum (1+ *unique-id*))))
+              (the fixnum *unique-id*)))
 
 (defun get-by-key (key)
   (gethash key *database*))
