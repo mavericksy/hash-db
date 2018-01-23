@@ -262,8 +262,7 @@
     #'(lambda (a b)
         (iter (for name in names)
               (for test in tests)
-              (always (funcall test (getf a name) (getf b name)))
-              ))))
+              (always (funcall test (getf a name) (getf b name)))))))
 
 (defun row-comparator (col-names schema)
   (let ((comparators (mapcar #'comparator (extract-schema col-names schema))))
@@ -274,6 +273,14 @@
               (with b-v = (getf b name))
               (always (funcall comp a-v b-v))
               (thereis (funcall comp b-v a-v))))))
+
+(defun column-matcher (col val)
+  (let ((name (name col))
+        (predicate (equality-predicate col))
+        (normalised (normalise-for-col val col)))
+    #'(lambda (row) (funcall predicate (getf row name) normalised))))
+
+
 
 (defun save-db (db file)
   (get-lock *write-lock*
