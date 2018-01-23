@@ -8,17 +8,15 @@
 (defpackage #:hash-db
   (:use
     #:cl
+    #:iterate
     #:bordeaux-threads
     #:cl-store
     #:alexandria)
-  (:export #:get-inc-unq-id
-           #:get-by-key
-           #:get-lock
-           #:get-database
-           #:ensure-gethash-local
-           #:*write-lock*
-           #:*read-lock*
-           #:*id-lock*
-           #:*class-check*
-           #:*database-class*
-           ))
+  (:export #:make-class-specific-col
+           #:show-tables
+           #:insert-row
+           #:make-schema
+           #:make-table
+           #:select
+           #:get-named-database
+           #:get-schema))
