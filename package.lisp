@@ -19,4 +19,7 @@
            #:make-table
            #:select
            #:get-named-database
-           #:get-schema))
+           #:get-schema
+           #:save-db
+           #:load-db
+           ))

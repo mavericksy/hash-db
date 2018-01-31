@@ -1,5 +1,5 @@
 ;;;; Flat files with primary-key and foreign key constraint ids.
-;;;; depends on cl-store ,BT and make-hash
+;;;; depends on cl-store ,BT, alexandria, iterate and make-hash
 ;;;; v.1
 
 (in-package :hash-db)
@@ -31,11 +31,14 @@
 (defparameter *read-lock* (bt:make-lock "READ-LOCK"))
 
 ;; Internal locking on tables.
+;; The tables lock is a slot
 (defmacro get-lock (lock &body body)
   `(bt:with-lock-held (,lock)
      ,@body))
 
 (locally (declare (optimize safety))
+         ;; A table defined with a unique name and schema
+         ;; table locking is implemented and rows are hash-tables
          (defclass table ()
            ((primary-key   :accessor pk
                            :initform 0
@@ -44,11 +47,11 @@
                            :initarg         :name
                            :type keyword)
             (row           :accessor rows
-                           :initarg         :rows)
+                           :initarg         :rows
+                           :initform        (make-rows))
             (schema        :accessor schema
                            :initarg         :schema)
             (lock          :accessor lock
-                           :initform nil
                            :initarg         :lock))
            (:documentation "A table in a database."))
 
@@ -59,12 +62,11 @@
            (schema table))
 
          (defmethod add-column ((table table) col-def)
-           (pushnew (apply #'make-col col-def) (schema table)))
-         )
+           (pushnew (apply #'make-col col-def) (schema table))))
 
 ;; Make an instance of a table with a hash-table rowset
 (defun create-table-instance (name schema)
-  (make-instance 'table :name name :rows (make-rows) :schema schema :lock (bt:make-lock name)))
+  (make-instance 'table :name name :schema schema :lock (bt:make-lock name)))
 
 (defun make-rows ()
   (create-hash-table))
@@ -73,7 +75,6 @@
   (or val (error "Column ~A can't be null" (name col))))
 
 ;; Create a class specific column to store instances of that class
-;; Make exportable
 ;;
 (defmacro make-class-specific-col (&key type
                                    class
@@ -81,8 +82,7 @@
                                    (eq-pred          nil eq-pred-p)
                                    (val-norm         nil val-norm-p)
                                    (references       nil references-p)
-                                   (constraint-check nil constraint-check-p)
-                                   )
+                                   (constraint-check nil constraint-check-p))
   (declare (ignore references))
   `(defmethod make-col (name (type (eql ',type)) &optional default-value references)
      (make-instance
@@ -122,6 +122,7 @@
                               :initform (error "Must supply a reference table for a foreign key column."))
             (foreign-column   :reader foreign-column
                               :initform :primary-key)
+            (equality-predicate :initform #'=)
             (value-normaliser :initform #'not-nullable)
             (constraint-check :reader constraint-check 
                               :initform 
@@ -137,8 +138,8 @@
                                                      (gethash 
                                                        primary-tbl 
                                                        *global-tables*)))))
-                                  fk
-                                  (error "Foreign key constraint violation")))))))
+                                      fk
+                                      (error "Foreign key constraint violation")))))))
 
 (defclass interned-values-column (column)
   ((interned-values    :reader interned-values
@@ -184,18 +185,17 @@
   (add-table-to-global (create-table-instance name (make-schema schema)) name))
 
 (locally (declare (optimize (speed 3)))
-(defun insert-row (name-and-values table)
-  (let ((tbl (gethash table *global-tables*)))
-    (unless tbl (error "The table: ~A does not exist" table))
-    (get-lock (lock tbl)
-      (let ((id (get-pk tbl)))
-        (ensure-gethash id (rows tbl) 
-                        (normalise-row name-and-values (schema tbl))))))))
+         (defun insert-row (name-and-values table)
+           (let ((tbl (gethash table *global-tables*)))
+             (unless tbl (error "The table: ~A does not exist" table))
+             (get-lock (lock tbl)
+               (let ((id (get-pk tbl)))
+                 (ensure-gethash id (rows tbl) 
+                                 (normalise-row name-and-values (schema tbl))))))))
 
 (defun normalise-row (names-and-values schema)
   (iter (for col in schema)
         (with nv = names-and-values)
-        (print nv)
         (if (equal :foreign-key (name col)) 
             (progn (collect (name col)) 
                    (collect (funcall (constraint-check col) 
@@ -241,7 +241,7 @@
       (error "No column: ~A in schema: ~A" col-name schema)))
 
 (defun restrict-rows (rows where)
-  (remove-if-not where rows))
+  (iter (for (k v) in-hashtable rows) (when (funcall where v) (collect v))))
 
 (defun project-columns (rows schema)
   (map 'vector (extractor schema) rows))
@@ -280,7 +280,14 @@
         (normalised (normalise-for-col val col)))
     #'(lambda (row) (funcall predicate (getf row name) normalised))))
 
+(defun column-matchers (schema names-and-values)
+  (iter (for (name val) on names-and-values by #'cddr)
+        (when val
+          (collect (column-matcher (find-column name schema) val)))))
 
+(defun matching (table &rest names-and-values)
+  (let ((matchers (column-matchers (schema table) names-and-values)))
+    #'(lambda (row) (every #'(lambda (matcher) (funcall matcher row)) matchers))))
 
 (defun save-db (db file)
   (get-lock *write-lock*
