@@ -15,10 +15,11 @@
 
 ; Global database table
 (defparameter *global-tables* (create-hash-table))
+
 (defun show-tables ()
   (iter (for (k v) in-hashtable *global-tables*) (collect k)))
 
-;; Push a tabe to the database, no duplicates
+;; Push a table to the database, no duplicates
 (defun add-table-to-global (db name)
   (ensure-gethash name *global-tables* db))
 
@@ -73,27 +74,6 @@
 
 (defun not-nullable (val col)
   (or val (error "Column ~A can't be null" (name col))))
-
-;; Create a class specific column to store instances of that class
-;;
-(defmacro make-class-specific-col (&key type
-                                   class
-                                   (comparator       nil comparator-p)
-                                   (eq-pred          nil eq-pred-p)
-                                   (val-norm         nil val-norm-p)
-                                   (references       nil references-p)
-                                   (constraint-check nil constraint-check-p))
-  (declare (ignore references))
-  `(defmethod make-col (name (type (eql ',type)) &optional default-value references)
-     (make-instance
-       ',class
-       :name name
-       ,@(when comparator-p       `(:comparator ,comparator))
-       ,@(when eq-pred-p          `(:equality-predicate ,eq-pred))
-       ,@(when val-norm-p         `(:value-normaliser ,val-norm))
-       ,@(when references-p       `(:references references))
-       ,@(when constraint-check-p `(:constraint-check ,constraint-check))
-       :default-value default-value)))
 
 (locally (declare (optimize safety))
          (defclass column ()
@@ -154,26 +134,53 @@
 
 (defgeneric make-col (name type &optional default-value references))
 
+;; Create a class specific column to store instances of that class
+;;
+(defmacro make-class-specific-col (&key type
+                                   class
+                                   (comparator       nil comparator-p)
+                                   (eq-pred          nil eq-pred-p)
+                                   (val-norm         nil val-norm-p)
+                                   (references       nil references-p)
+                                   (constraint-check nil constraint-check-p))
+  (declare (ignore references))
+  `(defmethod make-col (name (type (eql ',type)) &optional default-value references)
+     (make-instance
+       ',class
+       :name name
+       ,@(when comparator-p       `(:comparator ,comparator))
+       ,@(when eq-pred-p          `(:equality-predicate ,eq-pred))
+       ,@(when val-norm-p         `(:value-normaliser ,val-norm))
+       ,@(when references-p       `(:references references))
+       ,@(when constraint-check-p `(:constraint-check ,constraint-check))
+       :default-value default-value)))
+
+
 ;; A couple default column definitions
 ;;
 (make-class-specific-col :class column 
                          :type boolean 
                          :eq-pred #'=)
+
 (make-class-specific-col :class primary-key-column 
                          :type primary-key-column 
                          :comparator #'<)
+
 (make-class-specific-col :class foreign-key-column 
                          :type foreign-key-column
                          :comparator #'<
                          :references t)
+
 (make-class-specific-col :class column 
                          :type string 
                          :comparator #'string< 
                          :eq-pred #'string=)
+
 (make-class-specific-col :class column 
                          :type number 
                          :comparator #'< 
                          :eq-pred #'=)
+
 (make-class-specific-col :class interned-values-column 
                          :type interned-string 
                          :comparator #'string<)
@@ -182,18 +189,23 @@
   (mapcar #'(lambda (col-spec) (apply #'make-col col-spec)) spec))
 
 (defun make-table (name schema)
-  (add-table-to-global (create-table-instance name (make-schema schema)) name))
+  (add-table-to-global 
+    (create-table-instance name (if (eql (type-of (car schema)) 'column) 
+                                  schema 
+                                  (make-schema schema))) 
+    name))
 
-(locally (declare (optimize (speed 3)))
-         (defun insert-row (name-and-values table)
-           (let ((tbl (gethash table *global-tables*)))
-             (unless tbl (error "The table: ~A does not exist" table))
-             (get-lock (lock tbl)
-               (let ((id (get-pk tbl)))
-                 (ensure-gethash id (rows tbl) 
-                                 (normalise-row name-and-values (schema tbl))))))))
+(defun insert-row (name-and-values table)
+  (let ((tbl (get-named-table table)))
+    (if (not (eql (type-of tbl) 'table)) 
+      (error "The table: ~A does not exist" table)
+      (get-lock (lock tbl)
+                (let ((id (get-pk tbl)))
+                  (ensure-gethash id (rows tbl) 
+                                  (normalise-row name-and-values (schema tbl))))))))
 
 (defun normalise-row (names-and-values schema)
+  (format t "Names-and-columns ~a~%" names-and-values)
   (iter (for col in schema)
         (with nv = names-and-values)
         (if (equal :foreign-key (name col)) 
@@ -203,14 +215,18 @@
                                      (getf nv :foreign-key))))
             (let ((col-val (or (getf nv (name col)) (default-value col))))
               (collect (name col))
+              (format t "col-val ~a~%" col-val)
+              (format t "col ~a~%" col)
+              (format t "(name col) ~a~%" (name col))
+              (format t "nv ~a~%" nv)
               (collect (normalise-for-col col-val col))))))
 
 (defun normalise-for-col (val col)
   (funcall (value-normaliser col) val col))
 
 (defun select (&key (col t) from where distinct order-by inner-join)
-  (let ((rows (rows from))
-        (schema (schema from)))
+  (let ((rows (rows (get-named-table  from)))
+        (schema (schema (get-named-table from))))
     ;;
     (when inner-join
       ())
