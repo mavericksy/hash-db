@@ -15,6 +15,8 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; sql
+    #:sql-error #:error-position #:error-sql
     ;; history
     #:keep-history #:history #:with-as-of #:history-error
     ;; import and export

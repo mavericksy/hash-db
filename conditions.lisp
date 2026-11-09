@@ -72,6 +72,11 @@
                      (truncated-bytes condition) (error-file condition))))
   (:documentation "The log ended in a partial or damaged record. The damage was cut off."))
 
+(define-condition sql-error (hash-db-error)
+  ((position :initarg :position :reader error-position :initform nil)
+   (sql      :initarg :sql      :reader error-sql      :initform nil))
+  (:documentation "SQL text is not valid, or uses something that is not supported."))
+
 (define-condition history-error (hash-db-error) ()
   (:documentation "The version asked for is not kept. See keep-history."))
 
