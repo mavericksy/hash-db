@@ -17,6 +17,9 @@
 (define-condition no-such-column (hash-db-error)
   ((column :initarg :column :reader error-column)))
 
+(define-condition no-such-view (hash-db-error)
+  ((name :initarg :name :reader error-name)))
+
 (define-condition no-such-sequence (hash-db-error)
   ((name :initarg :name :reader error-name)))
 

@@ -15,6 +15,8 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; views
+    #:create-view #:drop-view #:show-views
     ;; sequences
     #:create-sequence #:drop-sequence #:next-value #:current-value #:restart-sequence
     #:show-sequences
@@ -28,7 +30,7 @@
     #:save-db #:load-db #:open-db #:close-db #:checkpoint
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
-    #:no-such-table #:no-such-column #:no-such-row #:no-such-sequence #:error-name
+    #:no-such-table #:no-such-column #:no-such-row #:no-such-sequence #:no-such-view #:error-name
     #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation

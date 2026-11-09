@@ -222,16 +222,28 @@
   (let ((object (values (fset:lookup (current-root) name))))
     (and (typep object 'table) object)))
 
-;; Accept a table name or a table value (for example a select result).
+;; A view is a stored query. See views.lisp.
+(defstruct (view (:constructor make-view (name query)))
+  name
+  query)
+
+(declaim (ftype function run-view))
+
+;; Accept a table name, a table value (for example a select result), or the name
+;; of a view. A view is run, and gives a table value.
 (defun find-table (designator)
   (cond ((typep designator 'table) designator)
         ((get-named-table designator))
+        ((typep (named-object designator) 'view) (run-view (named-object designator)))
         (t (error 'no-such-table :table designator
                   :message (format nil "The table: ~A does not exist" designator)))))
 
 ;; The stored table for a name or table value. Changes need a stored table.
 (defun stored-table (designator)
   (let ((name (if (typep designator 'table) (name designator) designator)))
+    (when (typep (named-object name) 'view)
+      (error 'schema-error
+             :message (format nil "~A is a view. Change the tables under it." name)))
     (or (get-named-table name)
         (error 'no-such-table :table name
                :message (format nil "The table: ~A does not exist" name)))))
@@ -246,6 +258,8 @@
 
 (defun drop-table (name)
   (with-transaction
+    (when (typep (named-object name) 'view)
+      (error 'schema-error :message (format nil "~A is a view. Use drop-view." name)))
     (when (get-named-table name)
       (let ((refs (remove name (referencing-columns name)
                           :key #'(lambda (ref) (name (car ref))) :test #'equal)))
