@@ -15,6 +15,8 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; json
+    #:json #:json-encode #:json-decode #:json-error
     ;; changing tables and migrations
     #:rename-table #:rename-column #:drop-column #:migrate #:migrate-all
     #:applied-migrations

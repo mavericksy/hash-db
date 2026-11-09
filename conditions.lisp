@@ -72,5 +72,8 @@
                      (truncated-bytes condition) (error-file condition))))
   (:documentation "The log ended in a partial or damaged record. The damage was cut off."))
 
+(define-condition json-error (hash-db-error) ()
+  (:documentation "Text is not JSON, or data can't be written as JSON."))
+
 (define-condition file-format-error (hash-db-error)
   ((file :initarg :file :reader error-file)))

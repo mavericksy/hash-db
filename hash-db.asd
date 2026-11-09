@@ -18,6 +18,7 @@
                (:file "hash-db")
                (:file "sequences")
                (:file "expr")
+               (:file "json")
                (:file "query")
                (:file "views")
                (:file "triggers")
@@ -39,7 +40,8 @@
                              (:file "extension-tests")
                              (:file "trigger-tests")
                              (:file "ttl-tests")
-                             (:file "alter-tests"))))
+                             (:file "alter-tests")
+                             (:file "json-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))
