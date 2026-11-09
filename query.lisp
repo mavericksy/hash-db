@@ -12,28 +12,99 @@
 ;; two rows that is true when the first row sorts first. See COMPILE-ORDER-KEY.
 ;; LIMIT and OFFSET cut the result after sorting.
 ;; Return a new table. Its rows are keyed 1..n in result order.
-(defun select (&key (col t) from where distinct order-by inner-join limit offset)
+(defun select (&key (col t) from where distinct order-by inner-join limit offset
+                 group-by having)
   (with-snapshot
     (let* ((tbl (find-table from))
            (schema (schema tbl))
-           (rows (row-list tbl))
-           (items nil))
+           (rows (row-list tbl)))
       (when inner-join
         (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
       (when where
         (setf rows (restrict-rows rows (compile-where where schema))))
-      (unless (eql col t)
-        (setf items (select-items col schema)))
-      (when order-by
-        (setf rows (sorted-rows rows schema order-by (item-aliases items))))
-      (when items
-        (setf schema (mapcar #'second items))
-        (setf rows (project-rows rows items)))
+      (multiple-value-setq (rows schema)
+        (if (grouped-query-p col group-by having order-by)
+            (select-groups rows schema col group-by having order-by)
+            (select-rows rows schema col order-by)))
       (when distinct
         (setf rows (distinct-rows rows schema)))
       (when (or limit offset)
         (setf rows (slice-rows rows limit offset)))
       (make-result-table rows schema))))
+
+;; Sort and project rows. Return the new rows and the schema of the result.
+(defun select-rows (rows schema col order-by)
+  (let ((items (unless (eql col t) (select-items col schema))))
+    (when order-by
+      (setf rows (sorted-rows rows (make-ectx schema (item-aliases items)) order-by)))
+    (if items
+        (values (project-rows rows items) (mapcar #'second items))
+        (values rows schema))))
+
+;;; Grouping
+;;;
+;;; GROUP-BY is a column, an expression, or a list of them. A list is always a list of
+;;; expressions, so one expression needs brackets: :group-by '((lower :city)).
+;;; A query is grouped when it has :group-by or :having, or when :col or :order-by holds
+;;; an aggregate. Without :group-by, all rows make one group, even if there are none.
+;;; A grouped query needs :col. :col, :having and :order-by can use the :group-by
+;;; expressions as they are written, aliases, and aggregates: (count), (count x),
+;;; (count-distinct x), (sum x), (avg x), (min x) and (max x). NULL values are skipped.
+;;; Groups come out in the order their first row appeared.
+
+(defun expression-list (x)
+  (cond ((null x) nil)
+        ((keywordp x) (list x))
+        ((listp x) x)
+        (t (list x))))
+
+(defun grouped-query-p (col group-by having order-by)
+  (or group-by
+      having
+      (and (not (eql col t))
+           (some #'contains-aggregate-p (if (listp col) col nil)))
+      (and order-by
+           (not (functionp order-by))
+           (some #'contains-aggregate-p
+                 (if (and (listp order-by) (not (direction-form-p order-by)))
+                     order-by
+                     (list order-by))))))
+
+(defun build-groups (rows key-fns)
+  (let ((table (make-hash-table :test 'equal))
+        (order '()))
+    (dolist (row rows)
+      (let* ((keys (mapcar #'(lambda (f) (funcall f row)) key-fns))
+             (id (mapcar #'distinct-key keys))
+             (group (gethash id table)))
+        (unless group
+          (setf group (make-grp nil keys)
+                (gethash id table) group)
+          (push group order))
+        (push row (grp-rows group))))
+    (dolist (group order)
+      (setf (grp-rows group) (nreverse (grp-rows group))))
+    (nreverse order)))
+
+(defun select-groups (rows schema col group-by having order-by)
+  (when (eql col t)
+    (error 'query-error :message "A query with :group-by or aggregates needs :col"))
+  (let* ((group-exprs (expression-list group-by))
+         (key-fns (mapcar #'(lambda (expr) (compile-value expr (make-ectx schema))) group-exprs))
+         (groups (build-groups rows key-fns))
+         (items (select-items col schema (make-ectx schema nil group-exprs t)))
+         (ctx (make-ectx schema (item-aliases items) group-exprs t)))
+    (when (and (null group-exprs) (null groups))
+      (setf groups (list (make-grp nil nil))))
+    (when having
+      (let ((keep (compile-expr having ctx)))
+        (setf groups (remove-if-not #'(lambda (group) (eq t (truth (funcall keep group)))) groups))))
+    (when (and order-by (not (functionp order-by)))
+      (setf groups (sorted-rows groups ctx order-by)))
+    (let ((result (project-rows groups items)))
+      (when (functionp order-by)
+        (setf result (stable-sort result order-by)))
+      (values result (mapcar #'second items)))))
 
 (defun make-result-table (rows schema)
   (make-instance 'table
@@ -107,6 +178,19 @@
 (defun as-form-p (x)
   (and (consp x) (symbolp (first x)) (string= (symbol-name (first x)) "AS")))
 
+;; The name of an item that has no (as ...): :COUNT for (count), :SUM-AGE for
+;; (sum :age), else :EXPRn where n is the place in the list.
+(defun default-alias (expr position)
+  (let ((aggregate (and (consp expr)
+                        (symbolp (first expr))
+                        (member (symbol-name (first expr)) *aggregate-names* :test #'string=)
+                        (symbol-name (first expr)))))
+    (as-keyword
+     (cond ((and aggregate (null (rest expr))) aggregate)
+           ((and aggregate (null (cddr expr)) (keywordp (second expr)))
+            (format nil "~A-~A" aggregate (symbol-name (second expr))))
+           (t (format nil "EXPR~D" position))))))
+
 ;; A column made for a result: it has a name, a comparison and an equality.
 (defun make-result-column (name &optional source)
   (make-instance 'column
@@ -116,11 +200,10 @@
                  :equality-predicate (if source (equality-predicate source) #'value-equal)))
 
 ;; Return a list of (name column function). The function takes a row.
-(defun select-items (col schema)
+(defun select-items (col schema &optional (ctx (make-ectx schema)))
   (let ((specs (cond ((keywordp col) (list col))
                      ((and col (listp col)) col)
                      (t (error 'query-error :message (format nil "Bad :col ~S" col)))))
-        (ctx (make-ectx schema))
         (items '()))
     (loop for spec in specs
           for position from 1
@@ -135,7 +218,7 @@
                                       (error 'query-error
                                              :message (format nil "AS takes an expression and a name: ~S" spec)))
                                     (values (second spec) (as-keyword (third spec))))
-                             (values spec (as-keyword (format nil "EXPR~D" position))))
+                             (values spec (default-alias spec position)))
                        (let ((source (and (keywordp expr) (not (eq expr :null))
                                           (find-column expr schema))))
                          (list alias (make-result-column alias source)
@@ -189,14 +272,16 @@
         ((listp order-by) (mapcar #'parse-order-key order-by))
         (t (list (parse-order-key order-by)))))
 
-;; Return (value-function less direction nulls). A column sorts by its own
+;; Return (value-function less direction nulls) for KEY. CTX says what names an
+;; expression can use. A column sorts by its own
 ;; comparator. Any other expression sorts with VALUE-LESS.
-(defun compile-order-key (key schema aliases)
+(defun compile-order-key (key ctx)
   (destructuring-bind (direction expr nulls) key
-    (let* ((alias (and (keywordp expr) (find expr aliases :key #'first)))
+    (let* ((alias (and (keywordp expr) (find expr (ectx-aliases ctx) :key #'first)))
            (column (cond (alias (third alias))
-                         ((and (keywordp expr) (not (eq expr :null))) (find-column expr schema))))
-           (value-fn (compile-value expr (make-ectx schema aliases))))
+                         ((and (keywordp expr) (not (eq expr :null)))
+                          (find-column expr (ectx-schema ctx)))))
+           (value-fn (compile-value expr ctx)))
       (list value-fn (or (and column (comparator column)) #'value-less) direction nulls))))
 
 ;; :lt, :eq or :gt for two lists of key values
@@ -214,10 +299,10 @@
                (return order)))
         finally (return :eq)))
 
-(defun sorted-rows (rows schema order-by &optional aliases)
+(defun sorted-rows (rows ctx order-by)
   (if (functionp order-by)
       (stable-sort (copy-list rows) order-by)
-      (let* ((keys (mapcar #'(lambda (key) (compile-order-key key schema aliases))
+      (let* ((keys (mapcar #'(lambda (key) (compile-order-key key ctx))
                            (order-keys order-by)))
              (decorated (mapcar #'(lambda (row)
                                     (cons (mapcar #'(lambda (key) (funcall (first key) row)) keys)

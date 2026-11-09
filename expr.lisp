@@ -62,9 +62,21 @@
 
 ;; SCHEMA is the columns an expression can name. ALIASES are result names
 ;; that an expression can name too, such as in ORDER-BY. Each is (name function column).
-(defstruct (ectx (:constructor make-ectx (schema &optional aliases)))
+;;
+;; In a grouped query, GROUPED is true and an expression works on a group, not on
+;; a row. A group is a GRP: its rows, and the values of the GROUP-BY expressions
+;; (its keys). GROUP-EXPRS are those expressions. In a group, an expression can
+;; use a group-by expression as it is written, an alias, and aggregates. A
+;; column that is not a group-by expression is an error outside an aggregate.
+(defstruct (ectx (:constructor make-ectx (schema &optional aliases group-exprs grouped)))
   schema
-  aliases)
+  aliases
+  group-exprs
+  grouped)
+
+(defstruct (grp (:constructor make-grp (rows keys)))
+  rows
+  keys)
 
 (defvar *expr-ops* (make-hash-table :test 'equal))
 
@@ -86,6 +98,13 @@
                       n))))
 
 (defun compile-expr (expr ctx)
+  (let ((key-position (and (ectx-grouped ctx)
+                           (position expr (ectx-group-exprs ctx) :test #'equal))))
+    (if key-position
+        #'(lambda (group) (nth key-position (grp-keys group)))
+        (compile-expr-1 expr ctx))))
+
+(defun compile-expr-1 (expr ctx)
   (cond ((eq expr :null) (constantly :null))
         ((keywordp expr) (compile-column-ref expr ctx))
         ((or (null expr) (eq expr t)) (constantly expr))
@@ -103,7 +122,10 @@
     (if alias
         (second alias)
         (let ((name (name (find-column keyword (ectx-schema ctx)))))
-          #'(lambda (row) (getf row name))))))
+          (if (ectx-grouped ctx)
+              (bad-expression "Column ~A must be in :group-by or inside an aggregate such as (max :~A)"
+                              name name)
+              #'(lambda (row) (getf row name)))))))
 
 (defun compile-call (expr ctx)
   (let ((op (first expr)))
@@ -355,3 +377,86 @@
     (let ((fns (compile-args (rest args) ctx)))
       #'(lambda (row)
           (apply function (mapcar #'materialize (call-all fns row)))))))
+
+;;; Aggregates. They work on a group. Their argument is an expression on a row.
+;;; NULL values are skipped.
+
+(defparameter *aggregate-names* '("COUNT" "COUNT-DISTINCT" "SUM" "AVG" "MIN" "MAX"))
+
+;; True when an expression holds an aggregate.
+(defun contains-aggregate-p (expr)
+  (and (consp expr)
+       (symbolp (first expr))
+       (let ((name (symbol-name (first expr))))
+         (cond ((member name *aggregate-names* :test #'string=) t)
+               ((string= name "QUOTE") nil)
+               ((string= name "FN") (some #'contains-aggregate-p (cddr expr)))
+               (t (some #'contains-aggregate-p (rest expr)))))))
+
+(defun row-context (ctx)
+  (make-ectx (ectx-schema ctx)))
+
+(defmacro define-aggregate (name min max (ctx args) &body body)
+  "Define an aggregate. BODY returns a function of a group's list of rows."
+  `(define-op ,name (,args ,ctx)
+     (unless (ectx-grouped ,ctx)
+       (bad-expression "~A is an aggregate. It can't be used in :where. Use it in :col, :having or :order-by."
+                       ,name))
+     (check-arity ,name ,args ,min ,max)
+     (let ((aggregate (progn ,@body)))
+       #'(lambda (group) (funcall aggregate (grp-rows group))))))
+
+;; The non-null values of an expression over rows.
+(defun non-null-values (fn rows)
+  (loop for row in rows
+        for v = (funcall fn row)
+        unless (nullish-p v) collect v))
+
+(define-aggregate "COUNT" 0 1 (ctx args)
+  (if args
+      (let ((fn (compile-value (first args) (row-context ctx))))
+        #'(lambda (rows) (length (non-null-values fn rows))))
+      #'length))
+
+;; Equal values must give the same key. Numbers match by value, as = does.
+(defun distinct-key (value)
+  (if (realp value) (rational value) value))
+
+(define-aggregate "COUNT-DISTINCT" 1 1 (ctx args)
+  (let ((fn (compile-value (first args) (row-context ctx))))
+    #'(lambda (rows)
+        (let ((seen (make-hash-table :test 'equal)))
+          (dolist (v (non-null-values fn rows))
+            (setf (gethash (distinct-key v) seen) t))
+          (hash-table-count seen)))))
+
+(define-aggregate "SUM" 1 1 (ctx args)
+  (let ((fn (compile-value (first args) (row-context ctx))))
+    #'(lambda (rows)
+        (let ((values (non-null-values fn rows)))
+          (if values
+              (apply #'+ (mapcar #'(lambda (v) (require-real v "SUM")) values))
+              :null)))))
+
+(define-aggregate "AVG" 1 1 (ctx args)
+  (let ((fn (compile-value (first args) (row-context ctx))))
+    #'(lambda (rows)
+        (let ((values (non-null-values fn rows)))
+          (if values
+              (float (/ (apply #'+ (mapcar #'(lambda (v) (require-real v "AVG")) values))
+                        (length values))
+                     1d0)
+              :null)))))
+
+(defmacro define-extreme (name keep-first-when)
+  `(define-aggregate ,name 1 1 (ctx args)
+     (let ((fn (compile-value (first args) (row-context ctx))))
+       #'(lambda (rows)
+           (let ((values (non-null-values fn rows)))
+             (if values
+                 (reduce #'(lambda (a b) (if (eq (value-compare a b) ,keep-first-when) a b))
+                         values)
+                 :null))))))
+
+(define-extreme "MIN" :lt)
+(define-extreme "MAX" :gt)
