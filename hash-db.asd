@@ -29,7 +29,8 @@
   :components ((:module "tests"
                 :components ((:file "package")
                              (:file "tests")
-                             (:file "query-tests"))))
+                             (:file "query-tests")
+                             (:file "index-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))

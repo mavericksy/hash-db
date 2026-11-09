@@ -163,6 +163,10 @@
                   :initform        (fset:empty-map))
    (schema        :reader schema
                   :initarg         :schema
+                  :initform        nil)
+   ;; list of INDEX structures. See the section on indexes.
+   (indexes       :reader indexes
+                  :initarg         :indexes
                   :initform        nil))
   (:documentation "A table in a database."))
 
@@ -170,10 +174,11 @@
   (schema table))
 
 (defun create-table-instance (name schema)
-  (make-instance 'table :name name :schema schema))
+  (ensure-implicit-indexes (make-instance 'table :name name :schema schema)))
 
-(defun updated-table (tbl &key (rows (rows tbl)) (pk (pk tbl)) (schema (schema tbl)))
-  (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema))
+(defun updated-table (tbl &key (rows (rows tbl)) (pk (pk tbl)) (schema (schema tbl))
+                            (indexes (indexes tbl)))
+  (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema :indexes indexes))
 
 ;; Store TBL in the working root. Only call this inside WITH-TRANSACTION.
 (defun put-table (tbl)
@@ -474,6 +479,189 @@
                          :value-type string
                          :comparator #'string<)
 
+;;; Indexes
+;;;
+;;; An index finds rows by the value of one column without a scan. It is an
+;;; immutable fset map from a normalised value to the ids of the rows that hold it.
+;;; Rows with NULL in the column are not in the index. A table holds its indexes,
+;;; and every change to a row makes new indexes with it, so a snapshot of the
+;;; database always has indexes that match its rows.
+;;;
+;;; Some indexes are implicit. A :unique column and a foreign key column get one,
+;;; so the checks on them do not scan. They come from the schema and are rebuilt
+;;; when a file loads. The primary key needs none, because rows are stored by id.
+
+;; Values of one kind must give keys that compare as the column compares them.
+;; Numbers become rationals, so 1 and 1.0 are one key. Strings are wrapped, because
+;; fset orders plain strings by length first, and a range scan needs string< order.
+(defstruct (skey (:constructor skey (string)))
+  string)
+
+(defmethod fset:compare ((a skey) (b skey))
+  (let ((x (skey-string a))
+        (y (skey-string b)))
+    (cond ((string< x y) :less)
+          ((string> x y) :greater)
+          (t :equal))))
+
+(defun index-key (value)
+  (cond ((realp value) (rational value))
+        ((stringp value) (skey value))
+        (t value)))
+
+;; Equal values must give equal keys in a hash table too. Numbers match by value,
+;; as = does.
+(defun distinct-key (value)
+  (if (realp value) (rational value) value))
+
+;; MAP holds key -> id for a unique index, and key -> fset set of ids for any other.
+(defstruct (index (:constructor make-index (name column unique explicit
+                                            &optional (map (fset:empty-map)))))
+  name
+  column
+  unique
+  explicit
+  map)
+
+(defun index-add (index id value)
+  (if (null-value-p value)
+      index
+      (let* ((key (index-key value))
+             (map (index-map index))
+             (new (copy-index index)))
+        (setf (index-map new)
+              (fset:with map key
+                         (if (index-unique index)
+                             id
+                             (fset:with (or (fset:lookup map key) (fset:empty-set)) id))))
+        new)))
+
+(defun index-remove (index id value)
+  (if (null-value-p value)
+      index
+      (let* ((key (index-key value))
+             (map (index-map index))
+             (entry (fset:lookup map key))
+             (new (copy-index index)))
+        (setf (index-map new)
+              (cond ((null entry) map)
+                    ((index-unique index) (if (eql entry id) (fset:less map key) map))
+                    (t (let ((rest (fset:less entry id)))
+                         (if (zerop (fset:size rest))
+                             (fset:less map key)
+                             (fset:with map key rest))))))
+        new)))
+
+;; The ids of rows whose column equals VALUE, in id order.
+(defun index-ids (index value)
+  (let ((entry (and (not (null-value-p value))
+                    (fset:lookup (index-map index) (index-key value)))))
+    (cond ((null entry) nil)
+          ((index-unique index) (list entry))
+          (t (fset:convert 'list entry)))))
+
+;; How many keys of MAP sort before KEY, and how many sort before or equal to it.
+;; FSET:RANK gives the rank of KEY when it is there. When it is not, it gives the rank
+;; of the key just below it, or -1.
+(defun keys-before (map key)
+  (multiple-value-bind (rank found) (fset:rank map key)
+    (if found rank (1+ rank))))
+
+(defun keys-through (map key)
+  (1+ (fset:rank map key)))
+
+;; The ids of rows whose value lies between LOW and HIGH, in value order. Pass
+;; nil for no limit on that side. Only for columns whose values are all real
+;; numbers or all strings.
+(defun index-range-ids (index low low-inclusive high high-inclusive)
+  (let* ((map (index-map index))
+         (start (cond ((null low) 0)
+                      (low-inclusive (keys-before map (index-key low)))
+                      (t (keys-through map (index-key low)))))
+         (end (cond ((null high) (fset:size map))
+                    (high-inclusive (keys-through map (index-key high)))
+                    (t (keys-before map (index-key high)))))
+         (ids '()))
+    (loop for rank from start below end
+          do (let ((entry (nth-value 1 (fset:at-rank map rank))))
+               (if (index-unique index)
+                   (push entry ids)
+                   (fset:do-set (id entry) (push id ids)))))
+    (nreverse ids)))
+
+;; A range scan needs an order that matches fset's order for the keys.
+(defun range-column-p (column)
+  (let ((type (value-type column)))
+    (and (not (eq type t))
+         (or (subtypep type 'real) (subtypep type 'string)))))
+
+(defun table-index-for (tbl column &optional unique-only)
+  "An index of TBL on COLUMN. A unique index comes first."
+  (let ((candidates (remove-if-not #'(lambda (ix) (eq (index-column ix) column)) (indexes tbl))))
+    (or (find-if #'index-unique candidates)
+        (and (not unique-only) (first candidates)))))
+
+(defun build-index (tbl name column unique explicit)
+  (let ((index (make-index name column unique explicit)))
+    (fset:do-map (id row (rows tbl))
+      (let ((value (getf row column)))
+        (when (and unique
+                   (not (null-value-p value))
+                   (fset:lookup (index-map index) (index-key value)))
+          (error 'unique-violation :table (name tbl) :column column
+                 :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                  value column (name tbl))))
+        (setf index (index-add index id value))))
+    index))
+
+(defun implicit-index-specs (schema)
+  "A list of (name column unique) for the columns that need an index."
+  (loop for col in schema
+        when (unique-p col)
+          collect (list (as-keyword (format nil "~A-UNIQUE" (name col))) (name col) t)
+        else when (typep col 'foreign-key-column)
+          collect (list (as-keyword (format nil "~A-FK" (name col))) (name col) nil)))
+
+;; Add the implicit indexes that TBL does not have yet.
+(defun ensure-implicit-indexes (tbl)
+  (let ((indexes (indexes tbl)))
+    (dolist (spec (implicit-index-specs (schema tbl)))
+      (destructuring-bind (name column unique) spec
+        (unless (find name indexes :key #'index-name)
+          (setf indexes (append indexes (list (build-index tbl name column unique nil)))))))
+    (if (eq indexes (indexes tbl))
+        tbl
+        (updated-table tbl :indexes indexes))))
+
+;; The table with row ID set to ROW, with its indexes kept in step. Use this and
+;; TABLE-WITHOUT-ROW for every change to the rows of a table.
+(defun table-with-row (tbl id row &key (pk (pk tbl)))
+  (let ((old (fset:lookup (rows tbl) id)))
+    (updated-table
+     tbl
+     :rows (fset:with (rows tbl) id row)
+     :pk pk
+     :indexes (mapcar #'(lambda (index)
+                          (let* ((column (index-column index))
+                                 (old-value (if old (getf old column :null) :null))
+                                 (new-value (getf row column :null)))
+                            (if (and (not (null-value-p old-value))
+                                     (not (null-value-p new-value))
+                                     (eq :equal (fset:compare (index-key old-value)
+                                                              (index-key new-value))))
+                                index
+                                (index-add (index-remove index id old-value) id new-value))))
+                      (indexes tbl)))))
+
+(defun table-without-row (tbl id)
+  (let ((old (fset:lookup (rows tbl) id)))
+    (updated-table
+     tbl
+     :rows (fset:less (rows tbl) id)
+     :indexes (mapcar #'(lambda (index)
+                          (index-remove index id (if old (getf old (index-column index) :null) :null)))
+                      (indexes tbl)))))
+
 (defun make-schema (spec)
   (mapcar #'(lambda (col-spec) (apply #'make-col col-spec)) spec))
 
@@ -507,22 +695,14 @@
 
 ;; A unique column may not hold the same non-null value in two rows.
 ;; ID is the row being written. It does not clash with itself.
-(defun check-unique (tbl id row cols)
-  (dolist (col cols)
-    (let ((val (getf row (name col)))
-          (same (equality-predicate col)))
-      (unless (null-value-p val)
-        (fset:do-map (other-id other (rows tbl))
-          (let ((other-val (getf other (name col))))
-            (when (and (/= other-id id)
-                       (not (null-value-p other-val))
-                       (funcall same other-val val))
-              (error 'unique-violation :table (name tbl) :column (name col)
-                     :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
-                                      val (name col) (name tbl))))))))))
-
-(defun unique-columns (schema)
-  (remove-if-not #'unique-p schema))
+(defun check-unique (tbl id row)
+  (dolist (index (indexes tbl))
+    (when (index-unique index)
+      (let ((value (getf row (index-column index))))
+        (when (find-if #'(lambda (other) (/= other id)) (index-ids index value))
+          (error 'unique-violation :table (name tbl) :column (index-column index)
+                 :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                  value (index-column index) (name tbl))))))))
 
 (defun find-column (col-name schema)
   (or (find (as-keyword col-name) schema :key #'name)
@@ -556,8 +736,8 @@
     (let* ((tbl (stored-table table))
            (id (1+ (pk tbl)))
            (row (normalise-row name-and-values (schema tbl) id)))
-      (check-unique tbl id row (unique-columns (schema tbl)))
-      (put-table (updated-table tbl :pk id :rows (fset:with (rows tbl) id row)))
+      (check-unique tbl id row)
+      (put-table (table-with-row tbl id row :pk id))
       (journal-add (list :insert (name tbl) id row))
       id)))
 
@@ -573,14 +753,12 @@
         (error 'no-such-row :table (name tbl) :id id
                :message (format nil "No row ~A in table: ~A" id (name tbl))))
       (check-known-columns names-and-values (schema tbl))
-      (let ((new (copy-list old))
-            (changed (iter (for key in names-and-values by #'cddr)
-                           (collect (find-column key (schema tbl))))))
+      (let ((new (copy-list old)))
         (iter (for (key val) on names-and-values by #'cddr)
               (setf (getf new (as-keyword key))
                     (resolve-column-value (find-column key (schema tbl)) val)))
-        (check-unique tbl id new (unique-columns changed))
-        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new)))
+        (check-unique tbl id new)
+        (put-table (table-with-row tbl id new))
         (journal-add (list :update (name tbl) id new))
         id))))
 
@@ -615,12 +793,11 @@
                    (push (cons tname id) deletes)
                    (dolist (ref (referencing-columns tname))
                      (destructuring-bind (child . col) ref
-                       (fset:do-map (child-id row (rows child))
-                         (when (eql (getf row (name col)) id)
-                           (ecase (on-delete col)
-                             (:restrict (push (list (name child) child-id col) restricts))
-                             (:cascade (visit (name child) child-id))
-                             (:set-null (push (list (name child) child-id col) nullifies))))))))))
+                       (dolist (child-id (index-ids (table-index-for child (name col)) id))
+                         (ecase (on-delete col)
+                           (:restrict (push (list (name child) child-id col) restricts))
+                           (:cascade (visit (name child) child-id))
+                           (:set-null (push (list (name child) child-id col) nullifies)))))))))
         (visit (name tbl) id))
       (dolist (r restricts)
         (destructuring-bind (child-name child-id col) r
@@ -637,11 +814,11 @@
       (let* ((tbl (stored-table tname))
              (new (copy-list (fset:lookup (rows tbl) id))))
         (setf (getf new (name col)) :null)
-        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new)))
+        (put-table (table-with-row tbl id new))
         (journal-add (list :update tname id new)))))
   (dolist (d deletes)
     (let ((tbl (stored-table (car d))))
-      (put-table (updated-table tbl :rows (fset:less (rows tbl) (cdr d))))
+      (put-table (table-without-row tbl (cdr d)))
       (journal-add (list :delete (car d) (cdr d))))))
 
 ;; Add a column to a table. Old rows get the column default.
@@ -652,23 +829,18 @@
              :message "Can't add a primary key column to an existing table"))
     (with-transaction
       (let ((tbl (stored-table table))
-            (new-rows (fset:empty-map))
-            (vals '()))
+            (new-rows (fset:empty-map)))
         (when (find (name col) (schema tbl) :key #'name)
           (error 'schema-error
                  :message (format nil "Column ~A already exists in table ~A" (name col) (name tbl))))
         (fset:do-map (id row (rows tbl))
           (let ((val (resolve-column-value col (column-default col))))
-            (unless (null-value-p val) (push val vals))
             (setf new-rows (fset:with new-rows id (append row (list (name col) val))))))
-        (when (unique-p col)
-          (loop for (val . rest) on vals
-                when (member val rest :test (equality-predicate col))
-                  do (error 'unique-violation :table (name tbl) :column (name col)
-                            :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
-                                             val (name col) (name tbl)))))
-        (put-table (updated-table tbl :rows new-rows
-                                      :schema (append (schema tbl) (list col))))
+        ;; the implicit index of the new column is built here, and a unique
+        ;; column with a repeated default fails here
+        (put-table (ensure-implicit-indexes
+                    (updated-table tbl :rows new-rows
+                                       :schema (append (schema tbl) (list col)))))
         (journal-add (list :add-column (name tbl) (spec col) (fset:convert 'list new-rows)))
         col))))
 
@@ -689,9 +861,10 @@
 
 (defun restore-table (snapshot)
   (destructuring-bind (name pk col-specs id-rows) snapshot
-    (make-instance 'table :name name :pk pk
-                          :schema (make-schema col-specs)
-                          :rows (fset:convert 'fset:map id-rows))))
+    (ensure-implicit-indexes
+     (make-instance 'table :name name :pk pk
+                           :schema (make-schema col-specs)
+                           :rows (fset:convert 'fset:map id-rows)))))
 
 ;; A file holds data only. A function option in a column spec (:check or
 ;; :default-fn) is saved if it is a function name, but not if it is a function object.
@@ -734,22 +907,23 @@
       (:insert
        (destructuring-bind (name id row) (rest entry)
          (let ((tbl (table-named name)))
-           (fset:with root name (updated-table tbl :pk id :rows (fset:with (rows tbl) id row))))))
+           (fset:with root name (table-with-row tbl id row :pk id)))))
       (:update
        (destructuring-bind (name id row) (rest entry)
          (let ((tbl (table-named name)))
-           (fset:with root name (updated-table tbl :rows (fset:with (rows tbl) id row))))))
+           (fset:with root name (table-with-row tbl id row)))))
       (:delete
        (destructuring-bind (name id) (rest entry)
          (let ((tbl (table-named name)))
-           (fset:with root name (updated-table tbl :rows (fset:less (rows tbl) id))))))
+           (fset:with root name (table-without-row tbl id)))))
       (:add-column
        (destructuring-bind (name spec id-rows) (rest entry)
          (let ((tbl (table-named name)))
            (fset:with root name
-                      (updated-table tbl
-                                     :schema (append (schema tbl) (list (apply #'make-col spec)))
-                                     :rows (fset:convert 'fset:map id-rows)))))))))
+                      (ensure-implicit-indexes
+                       (updated-table tbl
+                                      :schema (append (schema tbl) (list (apply #'make-col spec)))
+                                      :rows (fset:convert 'fset:map id-rows))))))))))
 
 (defun replay-entries (root entries)
   (dolist (entry entries root)

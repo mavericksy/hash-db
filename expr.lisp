@@ -418,10 +418,6 @@
         #'(lambda (rows) (length (non-null-values fn rows))))
       #'length))
 
-;; Equal values must give the same key. Numbers match by value, as = does.
-(defun distinct-key (value)
-  (if (realp value) (rational value) value))
-
 (define-aggregate "COUNT-DISTINCT" 1 1 (ctx args)
   (let ((fn (compile-value (first args) (row-context ctx))))
     #'(lambda (rows)
