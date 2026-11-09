@@ -44,6 +44,14 @@
 
 ;;; Three-valued truth: t, nil or :unknown
 
+;; An unknown truth value acts like NULL when it is used as a value.
+(defun nullish-p (value)
+  (or (null-value-p value) (eq value :unknown)))
+
+;; The value to store or show: unknown becomes NULL.
+(defun materialize (value)
+  (if (eq value :unknown) :null value))
+
 (defun truth (value)
   (cond ((eq value t) t)
         ((null value) nil)
@@ -52,8 +60,11 @@
 
 ;;; Compiler
 
-(defstruct (ectx (:constructor make-ectx (schema)))
-  schema)
+;; SCHEMA is the columns an expression can name. ALIASES are result names
+;; that an expression can name too, such as in ORDER-BY. Each is (name function column).
+(defstruct (ectx (:constructor make-ectx (schema &optional aliases)))
+  schema
+  aliases)
 
 (defvar *expr-ops* (make-hash-table :test 'equal))
 
@@ -82,9 +93,17 @@
         ((atom expr) (constantly expr))
         (t (compile-call expr ctx))))
 
+;; Compile an expression whose result is stored or sorted. Unknown becomes NULL.
+(defun compile-value (expr ctx)
+  (let ((f (compile-expr expr ctx)))
+    #'(lambda (row) (materialize (funcall f row)))))
+
 (defun compile-column-ref (keyword ctx)
-  (let ((name (name (find-column keyword (ectx-schema ctx)))))
-    #'(lambda (row) (getf row name))))
+  (let ((alias (find keyword (ectx-aliases ctx) :key #'first)))
+    (if alias
+        (second alias)
+        (let ((name (name (find-column keyword (ectx-schema ctx)))))
+          #'(lambda (row) (getf row name))))))
 
 (defun compile-call (expr ctx)
   (let ((op (first expr)))
@@ -158,7 +177,7 @@
        #'(lambda (row)
            (let ((a (funcall fa row))
                  (b (funcall fb row)))
-             (if (or (null-value-p a) (null-value-p b))
+             (if (or (nullish-p a) (nullish-p b))
                  :unknown
                  (let ((order (value-compare a b)))
                    (declare (ignorable order))
@@ -169,14 +188,14 @@
   (destructuring-bind (fa fb) (compile-args args ctx)
     #'(lambda (row)
         (let ((a (funcall fa row)) (b (funcall fb row)))
-          (if (or (null-value-p a) (null-value-p b)) :unknown (value-equal a b))))))
+          (if (or (nullish-p a) (nullish-p b)) :unknown (value-equal a b))))))
 
 (define-op "/=" (args ctx)
   (check-arity "/=" args 2)
   (destructuring-bind (fa fb) (compile-args args ctx)
     #'(lambda (row)
         (let ((a (funcall fa row)) (b (funcall fb row)))
-          (if (or (null-value-p a) (null-value-p b)) :unknown (not (value-equal a b)))))))
+          (if (or (nullish-p a) (nullish-p b)) :unknown (not (value-equal a b)))))))
 
 (define-comparison "<"  (eq order :lt))
 (define-comparison ">"  (eq order :gt))
@@ -188,12 +207,12 @@
   (destructuring-bind (fx &rest fvs) (compile-args args ctx)
     #'(lambda (row)
         (let ((x (funcall fx row)))
-          (if (null-value-p x)
+          (if (nullish-p x)
               :unknown
               (let ((unknown nil))
                 (dolist (f fvs (if unknown :unknown nil))
                   (let ((v (funcall f row)))
-                    (cond ((null-value-p v) (setf unknown t))
+                    (cond ((nullish-p v) (setf unknown t))
                           ((value-equal x v) (return t)))))))))))
 
 (define-op "BETWEEN" (args ctx)
@@ -202,9 +221,9 @@
     #'(lambda (row)
         (let ((x (funcall fx row)) (lo (funcall flo row)) (hi (funcall fhi row)))
           ;; the same as (and (>= x lo) (<= x hi)), with unknown for NULL
-          (let ((above (if (or (null-value-p x) (null-value-p lo)) :unknown
+          (let ((above (if (or (nullish-p x) (nullish-p lo)) :unknown
                            (not (eq (value-compare x lo) :lt))))
-                (below (if (or (null-value-p x) (null-value-p hi)) :unknown
+                (below (if (or (nullish-p x) (nullish-p hi)) :unknown
                            (not (eq (value-compare x hi) :gt)))))
             (cond ((or (null above) (null below)) nil)
                   ((or (eq above :unknown) (eq below :unknown)) :unknown)
@@ -213,12 +232,12 @@
 (define-op "IS-NULL" (args ctx)
   (check-arity "IS-NULL" args 1)
   (let ((f (compile-expr (first args) ctx)))
-    #'(lambda (row) (null-value-p (funcall f row)))))
+    #'(lambda (row) (nullish-p (funcall f row)))))
 
 (define-op "IS-NOT-NULL" (args ctx)
   (check-arity "IS-NOT-NULL" args 1)
   (let ((f (compile-expr (first args) ctx)))
-    #'(lambda (row) (not (null-value-p (funcall f row))))))
+    #'(lambda (row) (not (nullish-p (funcall f row))))))
 
 ;;; LIKE. % matches any run of characters, _ matches one character,
 ;;; and a backslash makes the next character plain.
@@ -259,7 +278,7 @@
   (destructuring-bind (fx fp) (compile-args args ctx)
     #'(lambda (row)
         (let ((x (funcall fx row)) (p (funcall fp row)))
-          (cond ((or (null-value-p x) (null-value-p p)) :unknown)
+          (cond ((or (nullish-p x) (nullish-p p)) :unknown)
                 ((and (stringp x) (stringp p)) (like-match-p x (like-tokens p)))
                 (t (bad-expression "LIKE needs strings, got ~S and ~S" x p)))))))
 
@@ -281,7 +300,7 @@
      (let ((fns (compile-args args ctx)))
        #'(lambda (row)
            (let ((,values (call-all fns row)))
-             (if (some #'null-value-p ,values)
+             (if (some #'nullish-p ,values)
                  :null
                  (progn (dolist (v ,values) (require-real v ,name))
                         ,@body)))))))
@@ -300,7 +319,7 @@
      (let ((f (compile-expr (first args) ctx)))
        #'(lambda (row)
            (let ((,s (funcall f row)))
-             (if (null-value-p ,s)
+             (if (nullish-p ,s)
                  :null
                  (progn (require-string ,s ,name) ,@body)))))))
 
@@ -313,7 +332,7 @@
   (let ((fns (compile-args args ctx)))
     #'(lambda (row)
         (let ((vs (call-all fns row)))
-          (if (some #'null-value-p vs)
+          (if (some #'nullish-p vs)
               :null
               (apply #'concatenate 'string
                      (mapcar #'(lambda (v) (require-string v "CONCAT")) vs)))))))
@@ -324,7 +343,7 @@
     #'(lambda (row)
         (dolist (f fns :null)
           (let ((v (funcall f row)))
-            (unless (null-value-p v) (return v)))))))
+            (unless (nullish-p v) (return v)))))))
 
 ;;; Your own functions
 
@@ -335,4 +354,4 @@
       (bad-expression "FN needs a function or the name of one, got ~S" function))
     (let ((fns (compile-args (rest args) ctx)))
       #'(lambda (row)
-          (apply function (call-all fns row))))))
+          (apply function (mapcar #'materialize (call-all fns row)))))))

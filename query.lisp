@@ -6,6 +6,8 @@
 ;; WHERE is a function of one row (see MATCHING), the name of one, or an
 ;; expression (see expr.lisp).
 ;; INNER-JOIN is (table-name column-here column-there).
+;; COL is t for all columns, one item, or a list of items. An item is a
+;; column, or (as expression alias), or an expression. See SELECT-ITEMS.
 ;; ORDER-BY is a column, an expression key, a list of keys, or a function of
 ;; two rows that is true when the first row sorts first. See COMPILE-ORDER-KEY.
 ;; LIMIT and OFFSET cut the result after sorting.
@@ -14,16 +16,19 @@
   (with-snapshot
     (let* ((tbl (find-table from))
            (schema (schema tbl))
-           (rows (row-list tbl)))
+           (rows (row-list tbl))
+           (items nil))
       (when inner-join
         (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
       (when where
         (setf rows (restrict-rows rows (compile-where where schema))))
-      (when order-by
-        (setf rows (sorted-rows rows schema order-by)))
       (unless (eql col t)
-        (setf schema (extract-schema (mklist col) schema))
-        (setf rows (project-columns rows schema)))
+        (setf items (select-items col schema)))
+      (when order-by
+        (setf rows (sorted-rows rows schema order-by (item-aliases items))))
+      (when items
+        (setf schema (mapcar #'second items))
+        (setf rows (project-rows rows items)))
       (when distinct
         (setf rows (distinct-rows rows schema)))
       (when (or limit offset)
@@ -40,17 +45,8 @@
                                            for id from 1
                                            collect (cons id row)))))
 
-(defun mklist (thing)
-  (if (listp thing) thing (list thing)))
-
-(defun extract-schema (col-names schema)
-  (iter (for c in col-names) (collect (find-column c schema))))
-
 (defun restrict-rows (rows where)
   (remove-if-not where rows))
-
-(defun project-columns (rows schema)
-  (mapcar (extractor schema) rows))
 
 (defun distinct-rows (rows schema)
   (remove-duplicates rows :test (row-equality-tester schema) :from-end t))
@@ -84,10 +80,6 @@
                                   collect (append a b)))
               (append schema (schema other))))))
 
-(defun extractor (schema)
-  (let ((names (mapcar #'name schema)))
-    #'(lambda (row) (iter (for c in names) (collect c) (collect (getf row c))))))
-
 (defun row-equality-tester (schema)
   (let ((names (mapcar #'name schema))
         (tests (mapcar #'equality-predicate schema)))
@@ -100,6 +92,71 @@
                         (cond ((and (null-value-p x) (null-value-p y)) t)
                               ((or (null-value-p x) (null-value-p y)) nil)
                               (t (funcall test x y)))))))))
+
+;;; Select items
+;;;
+;;; COL is t (every column), one item, or a list of items. An item is
+;;;   :age                    a column
+;;;   (as expression :alias)  an expression with a name. The expression can be
+;;;                           a column, which renames it.
+;;;   (+ :age 1)              an expression. It is named :EXPR1, :EXPR2 ...
+;;;                           by its place in the list.
+;;; A list in COL is always a list of items, so one expression needs brackets
+;;; around it: :col '((+ :age 1)).
+
+(defun as-form-p (x)
+  (and (consp x) (symbolp (first x)) (string= (symbol-name (first x)) "AS")))
+
+;; A column made for a result: it has a name, a comparison and an equality.
+(defun make-result-column (name &optional source)
+  (make-instance 'column
+                 :name name
+                 :value-type (if source (value-type source) t)
+                 :comparator (if source (or (comparator source) #'value-less) #'value-less)
+                 :equality-predicate (if source (equality-predicate source) #'value-equal)))
+
+;; Return a list of (name column function). The function takes a row.
+(defun select-items (col schema)
+  (let ((specs (cond ((keywordp col) (list col))
+                     ((and col (listp col)) col)
+                     (t (error 'query-error :message (format nil "Bad :col ~S" col)))))
+        (ctx (make-ectx schema))
+        (items '()))
+    (loop for spec in specs
+          for position from 1
+          do (push
+              (cond ((and (keywordp spec) (not (eq spec :null)))
+                     (let ((column (find-column spec schema)))
+                       (list (name column) column (compile-expr spec ctx))))
+                    (t
+                     (multiple-value-bind (expr alias)
+                         (if (as-form-p spec)
+                             (progn (unless (= 3 (length spec))
+                                      (error 'query-error
+                                             :message (format nil "AS takes an expression and a name: ~S" spec)))
+                                    (values (second spec) (as-keyword (third spec))))
+                             (values spec (as-keyword (format nil "EXPR~D" position))))
+                       (let ((source (and (keywordp expr) (not (eq expr :null))
+                                          (find-column expr schema))))
+                         (list alias (make-result-column alias source)
+                               (compile-value expr ctx))))))
+              items))
+    (setf items (nreverse items))
+    (let ((names (mapcar #'first items)))
+      (when (/= (length names) (length (remove-duplicates names)))
+        (error 'query-error :message (format nil "Two result columns have the same name: ~S" names))))
+    items))
+
+;; Aliases are the names of items that can be used in ORDER-BY.
+;; Each is (name function column).
+(defun item-aliases (items)
+  (mapcar #'(lambda (item) (list (first item) (third item) (second item))) items))
+
+(defun project-rows (rows items)
+  (mapcar #'(lambda (row)
+              (loop for (name nil fn) in items
+                    append (list name (funcall fn row))))
+          rows))
 
 ;;; Sorting
 ;;;
@@ -134,10 +191,12 @@
 
 ;; Return (value-function less direction nulls). A column sorts by its own
 ;; comparator. Any other expression sorts with VALUE-LESS.
-(defun compile-order-key (key schema)
+(defun compile-order-key (key schema aliases)
   (destructuring-bind (direction expr nulls) key
-    (let* ((column (and (keywordp expr) (not (eq expr :null)) (find-column expr schema)))
-           (value-fn (compile-expr expr (make-ectx schema))))
+    (let* ((alias (and (keywordp expr) (find expr aliases :key #'first)))
+           (column (cond (alias (third alias))
+                         ((and (keywordp expr) (not (eq expr :null))) (find-column expr schema))))
+           (value-fn (compile-value expr (make-ectx schema aliases))))
       (list value-fn (or (and column (comparator column)) #'value-less) direction nulls))))
 
 ;; :lt, :eq or :gt for two lists of key values
@@ -155,10 +214,11 @@
                (return order)))
         finally (return :eq)))
 
-(defun sorted-rows (rows schema order-by)
+(defun sorted-rows (rows schema order-by &optional aliases)
   (if (functionp order-by)
       (stable-sort (copy-list rows) order-by)
-      (let* ((keys (mapcar #'(lambda (key) (compile-order-key key schema)) (order-keys order-by)))
+      (let* ((keys (mapcar #'(lambda (key) (compile-order-key key schema aliases))
+                           (order-keys order-by)))
              (decorated (mapcar #'(lambda (row)
                                     (cons (mapcar #'(lambda (key) (funcall (first key) row)) keys)
                                           row))
