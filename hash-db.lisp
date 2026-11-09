@@ -126,6 +126,17 @@
    (default-value       :reader default-value
                         :initarg                    :default
                         :initform :null)
+   ;; function designator called with no arguments for each new row
+   (default-fn          :reader default-fn
+                        :initarg                    :default-fn
+                        :initform nil)
+   (unique              :reader unique-p
+                        :initarg                    :unique
+                        :initform nil)
+   ;; function designator called with a value. Nil result rejects the value.
+   (check               :reader check-fn
+                        :initarg                    :check
+                        :initform nil)
    (value-normaliser    :reader value-normaliser
                         :initarg                    :value-normaliser
                         :initform #'keep-value))
@@ -155,10 +166,25 @@
     (error 'schema-error
            :message (format nil "Must supply a reference table for the foreign key column ~A." (name col)))))
 
-;; A default value must pass the same checks as any other value.
+;; A constant default value must pass the same checks as any other value.
 (defmethod initialize-instance :after ((col column) &key)
+  (flet ((designator-p (x) (typep x '(or function (and symbol (not null))))))
+    (dolist (option (list (cons :default-fn (default-fn col)) (cons :check (check-fn col))))
+      (when (and (cdr option) (not (designator-p (cdr option))))
+        (error 'schema-error
+               :message (format nil "Option ~S of column ~A must be a function or a function name"
+                                (car option) (name col))))))
+  (when (and (default-fn col) (not (null-value-p (default-value col))))
+    (error 'schema-error
+           :message (format nil "Column ~A has both :default and :default-fn" (name col))))
   (unless (null-value-p (default-value col))
     (normalise-for-col (default-value col) col)))
+
+;; The value for a column that a new row does not give.
+(defun column-default (col)
+  (if (default-fn col)
+      (funcall (default-fn col))
+      (default-value col)))
 
 (defun intern-for-column (val col)
   (let ((hash (interned-values col)))
@@ -217,7 +243,8 @@
                                    (extra-options    nil))
   `(defmethod make-col (name (type (eql ',type)) &rest options)
      (declare (ignorable type))
-     (check-column-options ',type options '(:default ,@extra-options))
+     (check-column-options ',type options
+                          '(:default :default-fn :not-null :unique :check ,@extra-options))
      (apply #'make-instance
             ',class
             :name (as-keyword name)
@@ -318,9 +345,32 @@
 ;; Value for COL as stored: type and null checks run, then a foreign key must exist.
 (defun resolve-column-value (col val)
   (let ((normalised (normalise-for-col val col)))
-    (when (and (typep col 'foreign-key-column) (not (null-value-p normalised)))
-      (check-foreign-key (references col) normalised))
+    (unless (null-value-p normalised)
+      (when (and (check-fn col) (not (funcall (check-fn col) normalised)))
+        (error 'check-violation :column (name col)
+               :message (format nil "Check failed for column ~A: value ~S" (name col) normalised)))
+      (when (typep col 'foreign-key-column)
+        (check-foreign-key (references col) normalised)))
     normalised))
+
+;; A unique column may not hold the same non-null value in two rows.
+;; ID is the row being written. It does not clash with itself.
+(defun check-unique (tbl id row cols)
+  (dolist (col cols)
+    (let ((val (getf row (name col)))
+          (same (equality-predicate col)))
+      (unless (null-value-p val)
+        (iter (for (other-id other) in-hashtable (rows tbl))
+              (let ((other-val (getf other (name col))))
+                (when (and (/= other-id id)
+                           (not (null-value-p other-val))
+                           (funcall same other-val val))
+                  (error 'unique-violation :table (name tbl) :column (name col)
+                         :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                          val (name col) (name tbl))))))))))
+
+(defun unique-columns (schema)
+  (remove-if-not #'unique-p schema))
 
 (defun find-column (col-name schema)
   (or (find (as-keyword col-name) schema :key #'name)
@@ -338,7 +388,7 @@
 
 (defun supplied-or-default (names-and-values col)
   (let ((val (getf names-and-values (name col) '%missing)))
-    (if (eq val '%missing) (default-value col) val)))
+    (if (eq val '%missing) (column-default col) val)))
 
 (defun normalise-row (names-and-values schema id)
   (check-known-columns names-and-values schema)
@@ -354,6 +404,7 @@
     (get-lock (lock tbl)
       (let* ((id (1+ (pk tbl)))
              (row (normalise-row name-and-values (schema tbl) id)))
+        (check-unique tbl id row (unique-columns (schema tbl)))
         (setf (pk tbl) id
               (gethash id (rows tbl)) row)
         id))))
@@ -372,10 +423,13 @@
           (error 'no-such-row :table (name tbl) :id id
                  :message (format nil "No row ~A in table: ~A" id (name tbl))))
         (check-known-columns names-and-values (schema tbl))
-        (let ((new (copy-list old)))
+        (let ((new (copy-list old))
+              (changed (iter (for key in names-and-values by #'cddr)
+                             (collect (find-column key (schema tbl))))))
           (iter (for (key val) on names-and-values by #'cddr)
                 (setf (getf new (as-keyword key))
                       (resolve-column-value (find-column key (schema tbl)) val)))
+          (check-unique tbl id new (unique-columns changed))
           (setf (gethash id (rows tbl)) new)
           id)))))
 
@@ -395,10 +449,22 @@
       (when (find (name col) (schema table) :key #'name)
         (error 'schema-error
                :message (format nil "Column ~A already exists in table ~A" (name col) (name table))))
-      (let ((val (resolve-column-value col (default-value col))))
-        (dolist (id (hash-table-keys (rows table)))
-          (setf (gethash id (rows table))
-                (append (gethash id (rows table)) (list (name col) val)))))
+      ;; Build every new row first, so an error leaves the table unchanged.
+      (let* ((ids (hash-table-keys (rows table)))
+             (new-rows (mapcar #'(lambda (id)
+                                   (append (gethash id (rows table))
+                                           (list (name col)
+                                                 (resolve-column-value col (column-default col)))))
+                               ids))
+             (vals (remove-if #'null-value-p
+                              (mapcar #'(lambda (row) (getf row (name col))) new-rows))))
+        (when (unique-p col)
+          (loop for (val . rest) on vals
+                when (member val rest :test (equality-predicate col))
+                  do (error 'unique-violation :table (name table) :column (name col)
+                            :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                             val (name col) (name table)))))
+        (mapc #'(lambda (id row) (setf (gethash id (rows table)) row)) ids new-rows))
       (setf (schema table) (append (schema table) (list col)))
       col)))
 
@@ -557,9 +623,21 @@
         (setf (gethash (car id-row) (rows tbl)) (cdr id-row)))
       tbl)))
 
+;; A file holds data only. A function option in a column spec (:check or
+;; :default-fn) is saved if it is a function name, but not if it is a function object.
+(defun check-savable ()
+  (iter (for tbl in (hash-table-values *global-tables*))
+        (iter (for col in (schema tbl))
+              (iter (for (key val) on (cddr (spec col)) by #'cddr)
+                    (when (functionp val)
+                      (error 'schema-error
+                             :message (format nil "Can't save column ~A of table ~A: option ~S is a function object. Use a function name."
+                                              (name col) (name tbl) key)))))))
+
 ;; Write all tables to FILE. Return FILE.
 (defun save-db (file)
   (get-lock *file-lock*
+    (check-savable)
     (let ((snapshots (get-lock *tables-lock*
                        (mapcar #'table-snapshot (hash-table-values *global-tables*)))))
       (cl-store:store (list :hash-db +file-format-version+ snapshots) file)

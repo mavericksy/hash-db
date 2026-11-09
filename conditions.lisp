@@ -46,6 +46,8 @@
 
 (define-condition not-null-violation (constraint-violation) ())
 (define-condition type-mismatch (constraint-violation) ())
+(define-condition unique-violation (constraint-violation) ())
+(define-condition check-violation (constraint-violation) ())
 (define-condition foreign-key-violation (constraint-violation) ())
 
 ;;; Files

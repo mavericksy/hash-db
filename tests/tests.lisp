@@ -288,6 +288,137 @@
                                :inner-join '("people" :owner :id)
                                :col :pet)))))
 
+(defun call-with-temp-file (fn)
+  (let ((path (merge-pathnames (format nil "hash-db-test-~A.db" (random 1000000000))
+                               (uiop:temporary-directory))))
+    (unwind-protect (funcall fn path)
+      (when (probe-file path) (delete-file path)))))
+
+;;; NOT NULL, UNIQUE, CHECK, DEFAULT
+
+(defun positive-p (n) (> n 0))
+(defvar *stamp* 0)
+(defun next-stamp () (incf *stamp*))
+
+(def-test not-null-option (:fixture clean-db)
+  (make-table "t" '((:a string :not-null t) (:b string)))
+  (signals not-null-violation (insert-row '(:b "x") "t"))
+  (signals not-null-violation (insert-row '(:a :null) "t"))
+  (finishes (insert-row '(:a "x") "t"))
+  (signals not-null-violation (update-row 1 '(:a :null) "t")))
+
+(def-test not-null-column-can-use-a-default (:fixture clean-db)
+  (make-table "t" '((:a string :not-null t :default "none")))
+  (insert-row '() "t")
+  (is (equal "none" (getf (get-row 1 "t") :a))))
+
+(def-test unique-rejects-a-duplicate-on-insert (:fixture clean-db)
+  (make-table "t" '((:email string :unique t) (:n number)))
+  (insert-row '(:email "a@x") "t")
+  (signals unique-violation (insert-row '(:email "a@x") "t"))
+  (finishes (insert-row '(:email "b@x") "t"))
+  (is (= 2 (length (row-list "t")))))
+
+(def-test unique-allows-many-nulls (:fixture clean-db)
+  (make-table "t" '((:email string :unique t)))
+  (insert-row '() "t")
+  (insert-row '() "t")
+  (insert-row '(:email :null) "t")
+  (is (= 3 (length (row-list "t")))))
+
+(def-test unique-on-update (:fixture clean-db)
+  (make-table "t" '((:email string :unique t) (:n number)))
+  (insert-row '(:email "a") "t")
+  (insert-row '(:email "b") "t")
+  (signals unique-violation (update-row 2 '(:email "a") "t"))
+  (is (equal "b" (getf (get-row 2 "t") :email)))
+  (finishes (update-row 1 '(:email "a" :n 1) "t")
+            "a row does not clash with itself")
+  (finishes (update-row 2 '(:email "c") "t")))
+
+(def-test unique-uses-the-column-comparison (:fixture clean-db)
+  (make-table "t" '((:n number :unique t)))
+  (insert-row '(:n 1) "t")
+  (signals unique-violation (insert-row '(:n 1.0) "t")))
+
+(def-test add-unique-column (:fixture clean-db)
+  (make-table "t" '((:a number)))
+  (insert-row '(:a 1) "t")
+  (finishes (add-column (find-table "t") '(:u number :unique t :default 5)))
+  (is (= 5 (getf (get-row 1 "t") :u)))
+  (signals unique-violation (insert-row '(:a 2) "t") "the default 5 is already taken")
+  (finishes (insert-row '(:a 2 :u 6) "t")))
+
+(def-test add-unique-column-with-a-shared-default-fails (:fixture clean-db)
+  (make-table "t" '((:a number)))
+  (insert-row '(:a 1) "t")
+  (insert-row '(:a 2) "t")
+  (signals unique-violation (add-column (find-table "t") '(:u number :unique t :default 5)))
+  (is (equal '(:a) (mapcar #'name (schema (find-table "t")))))
+  (is (equal '(:a 1) (get-row 1 "t"))))
+
+(def-test add-not-null-column (:fixture clean-db)
+  (make-table "t" '((:a number)))
+  (finishes (add-column (find-table "t") '(:b number :not-null t)))
+  (insert-row '(:a 1 :b 2) "t")
+  (signals not-null-violation (add-column (find-table "t") '(:c number :not-null t))))
+
+(def-test check-option (:fixture clean-db)
+  (make-table "t" (list '(:n number :check positive-p)
+                        (list :m 'number :check (lambda (v) (< v 10)))))
+  (finishes (insert-row '(:n 1 :m 2) "t"))
+  (signals check-violation (insert-row '(:n 0) "t"))
+  (signals check-violation (insert-row '(:m 10) "t"))
+  (signals check-violation (update-row 1 '(:n -5) "t"))
+  (finishes (insert-row '() "t") "check does not run on NULL"))
+
+(def-test check-runs-after-the-type-check (:fixture clean-db)
+  (make-table "t" '((:n number :check positive-p)))
+  (signals type-mismatch (insert-row '(:n "x") "t")))
+
+(def-test default-fn-runs-for-each-row (:fixture clean-db)
+  (setf *stamp* 0)
+  (make-table "t" '((:ts integer :default-fn next-stamp)))
+  (insert-row '() "t")
+  (insert-row '() "t")
+  (insert-row '(:ts 99) "t")
+  (is (equal '(1 2 99) (mapcar (lambda (r) (getf r :ts)) (row-list "t")))))
+
+(def-test default-fn-fills-old-rows-on-add-column (:fixture clean-db)
+  (setf *stamp* 0)
+  (make-table "t" '((:a number)))
+  (insert-row '(:a 1) "t")
+  (insert-row '(:a 2) "t")
+  (add-column (find-table "t") '(:ts integer :default-fn next-stamp))
+  (is (equal '(1 2) (sort (mapcar (lambda (r) (getf r :ts)) (row-list "t")) #'<))))
+
+(def-test bad-constraint-options (:fixture clean-db)
+  (signals schema-error (make-table "t" '((:n number :default 1 :default-fn next-stamp))))
+  (signals schema-error (make-table "t" '((:n number :check 5))))
+  (signals schema-error (make-table "t" '((:n number :default-fn "next-stamp")))))
+
+(def-test save-keeps-constraints-given-as-function-names (:fixture clean-db)
+  (make-table "t" '((:id primary-key-column)
+                    (:n number :check positive-p :unique t :not-null t)
+                    (:ts integer :default-fn next-stamp)))
+  (insert-row '(:n 1) "t")
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (clrhash hash-db::*global-tables*)
+      (load-db path)))
+  (signals check-violation (insert-row '(:n -1) "t"))
+  (signals unique-violation (insert-row '(:n 1) "t"))
+  (signals not-null-violation (insert-row '() "t"))
+  (finishes (insert-row '(:n 2) "t")))
+
+(def-test save-refuses-function-objects (:fixture clean-db)
+  (make-table "t" (list (list :n 'number :check (lambda (v) (> v 0)))))
+  (call-with-temp-file
+    (lambda (path)
+      (signals schema-error (save-db path))
+      (is (null (probe-file path))))))
+
 ;;; select
 
 (def-test select-all-rows (:fixture clean-db)
@@ -400,12 +531,6 @@
   (signals query-error (select :from "pets" :inner-join '("people" :owner :id))))
 
 ;;; persistence
-
-(defun call-with-temp-file (fn)
-  (let ((path (merge-pathnames (format nil "hash-db-test-~A.db" (random 1000000000))
-                               (uiop:temporary-directory))))
-    (unwind-protect (funcall fn path)
-      (when (probe-file path) (delete-file path)))))
 
 (def-test save-and-load-round-trip (:fixture clean-db)
   (make-people)
