@@ -15,6 +15,8 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; history
+    #:keep-history #:history #:with-as-of #:history-error
     ;; import and export
     #:export-csv #:import-csv #:export-json #:import-json #:import-error #:error-line
     ;; json

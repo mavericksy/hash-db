@@ -52,6 +52,10 @@
   (post-commit-fn nil)
   ;; the background thread that removes expired rows, or nil. See ttl.lisp.
   (sweeper nil)
+  ;; Kept older roots, newest first, as (seq time root). See history.lisp.
+  (history nil)
+  ;; how many to keep. 0 keeps none.
+  (history-limit 0)
   ;; the snapshot file of an open database
   (path nil))
 
@@ -72,6 +76,16 @@
 (defvar *commit-hook* nil)
 
 (defvar *txn* nil)
+
+;; True inside WITH-AS-OF. The database can't be changed there.
+(defvar *as-of* nil)
+
+;; The time. Universal time, in whole seconds. Bind or set it to test anything that
+;; depends on time.
+(defvar *clock* #'get-universal-time)
+
+(defun now ()
+  (funcall *clock*))
 
 (defun journal-add (entry)
   (push entry (txn-journal *txn*)))
@@ -108,6 +122,9 @@
   (if *txn*
       (call-with-savepoint fn)
       (with-writer
+        (when *as-of*
+          (error 'transaction-error
+                 :message "The database is read only inside with-as-of"))
         (let ((*txn* (make-txn (db-root *db*))))
           (catch 'rollback
             (multiple-value-prog1 (funcall fn)
@@ -125,8 +142,17 @@
           (funcall (db-commit-fn *db*) seq entries))
         (setf (db-seq *db*) seq)))
     (setf (db-root *db*) (txn-root *txn*))
+    (when (and entries (plusp (db-history-limit *db*)))
+      (record-history (db-seq *db*) (db-root *db*)))
     (when (and entries (db-post-commit-fn *db*))
       (funcall (db-post-commit-fn *db*)))))
+
+;; Keep the newest committed roots, as many as the limit says.
+(defun record-history (seq root)
+  (let ((limit (db-history-limit *db*)))
+    (push (list seq (now) root) (db-history *db*))
+    (when (> (length (db-history *db*)) limit)
+      (setf (db-history *db*) (subseq (db-history *db*) 0 limit)))))
 
 (defun call-with-savepoint (fn)
   (let ((saved (txn-root *txn*))

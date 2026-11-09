@@ -72,6 +72,9 @@
                      (truncated-bytes condition) (error-file condition))))
   (:documentation "The log ended in a partial or damaged record. The damage was cut off."))
 
+(define-condition history-error (hash-db-error) ()
+  (:documentation "The version asked for is not kept. See keep-history."))
+
 (define-condition json-error (hash-db-error) ()
   (:documentation "Text is not JSON, or data can't be written as JSON."))
 

@@ -16,12 +16,6 @@
 
 (in-package :hash-db)
 
-;; The time. Universal time, in whole seconds. Bind or set it to test expiry.
-(defvar *clock* #'get-universal-time)
-
-(defun now ()
-  (funcall *clock*))
-
 ;; A timestamp SECONDS from now.
 (defun expires-in (seconds)
   (+ (now) seconds))
