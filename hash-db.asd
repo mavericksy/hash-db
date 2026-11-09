@@ -16,6 +16,7 @@
   :components ((:file "package")
                (:file "conditions")
                (:file "hash-db")
+               (:file "sequences")
                (:file "expr")
                (:file "query")
                ;; the write-ahead log needs SBCL: sb-posix and sb-ext

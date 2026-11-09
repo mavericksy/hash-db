@@ -181,6 +181,24 @@
                             (indexes (indexes tbl)))
   (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema :indexes indexes))
 
+;; Store or remove any named thing in the working root. Only inside WITH-TRANSACTION.
+(defun put-object (name object)
+  (setf (txn-root *txn*) (fset:with (txn-root *txn*) name object))
+  object)
+
+(defun remove-object (name)
+  (setf (txn-root *txn*) (fset:less (txn-root *txn*) name)))
+
+;; Any named thing in the working root, or nil.
+(defun named-object (name)
+  (values (fset:lookup (current-root) name)))
+
+;; Signal schema-error if NAME is taken by a table or by anything else.
+(defun check-name-free (name what)
+  (when (nth-value 1 (fset:lookup (current-root) name))
+    (error 'schema-error
+           :message (format nil "Can't make ~A ~A: the name is already used" what name))))
+
 ;; Store TBL in the working root. Only call this inside WITH-TRANSACTION.
 (defun put-table (tbl)
   (setf (txn-root *txn*) (fset:with (txn-root *txn*) (name tbl) tbl))
