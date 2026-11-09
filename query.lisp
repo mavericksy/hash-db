@@ -2,7 +2,9 @@
 
 (in-package :hash-db)
 
-;; Run a query. WHERE is a function of one row, see MATCHING.
+;; Run a query.
+;; WHERE is a function of one row (see MATCHING), the name of one, or an
+;; expression (see expr.lisp).
 ;; INNER-JOIN is (table-name column-here column-there).
 ;; Return a new table. Its rows are keyed 1..n in result order.
 (defun select (&key (col t) from where distinct order-by inner-join)
@@ -13,7 +15,7 @@
       (when inner-join
         (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
       (when where
-        (setf rows (restrict-rows rows where)))
+        (setf rows (restrict-rows rows (compile-where where schema))))
       (when order-by
         (setf rows (sorted-rows rows schema (mklist order-by))))
       (unless (eql col t)

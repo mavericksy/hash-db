@@ -16,6 +16,7 @@
   :components ((:file "package")
                (:file "conditions")
                (:file "hash-db")
+               (:file "expr")
                (:file "query")
                ;; the write-ahead log needs SBCL: sb-posix and sb-ext
                (:file "wal" :if-feature :sbcl))
@@ -27,7 +28,8 @@
   :serial t
   :components ((:module "tests"
                 :components ((:file "package")
-                             (:file "tests"))))
+                             (:file "tests")
+                             (:file "query-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))
