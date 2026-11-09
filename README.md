@@ -155,6 +155,7 @@ hash-db-error
   invalid-row
   query-error
   file-format-error
+  persistence-error
   transaction-error
   constraint-violation
     not-null-violation, type-mismatch, unique-violation,
@@ -163,18 +164,47 @@ hash-db-error
 
 Use `error-table`, `error-column`, `error-id`, `error-file` and `error-message` to read the details.
 
+## Durability
+
+`open-db` makes the database durable. Every committed transaction goes to a log file and is flushed to disk before it becomes visible. After a crash, the next `open-db` replays the log.
+
+```lisp
+(open-db "my.db")      ; files: my.db (snapshot) and my.db.wal (log)
+(make-table ...)       ; from here on, every commit is logged
+(checkpoint)           ; fold the log into the snapshot now
+(close-db)             ; checkpoint, then stop logging
+```
+
+- `open-db` creates the files if they do not exist. If tables are in memory and no files exist, the tables become the first snapshot. If files exist, memory must be empty.
+- A commit is durable when the function that made it returns. If the log write fails, the transaction does not commit and you get `persistence-error`.
+- The log folds into the snapshot when it passes `:checkpoint-bytes` (default 8 MiB, `nil` turns it off). A failed automatic checkpoint only warns. The commit is already in the log.
+- `:sync :always` (default) flushes every commit. `:sync :never` leaves flushing to the operating system. A killed process still keeps its commits. A power loss can lose the last ones.
+- `(close-db :checkpoint nil)` keeps the log as it is.
+- After a crash, the log can end in a partial record. `open-db` cuts it off and signals the warning `wal-truncated`. Everything before the damage is kept. If a record in the middle is damaged, the records after it are lost too.
+- A jump in transaction numbers in the log signals `persistence-error`, because data is missing.
+- Values must print and read back. Strings, numbers, keywords, symbols, lists and vectors do. A function, a stream or a hash table does not, and the commit fails with `persistence-error`.
+- `save-db` and `load-db` stay for plain snapshots. `save-db` refuses the snapshot of the open database. `load-db` refuses an open database.
+
+Limits:
+
+- The log needs SBCL. `save-db` and `load-db` work on other implementations, but without flushing.
+- One process may open a database at a time. There is no lock file.
+- On macOS, `fsync` does not force the drive to empty its own cache. A power loss can still lose recent commits there.
+
 ## Save and load
 
 ```lisp
-(save-db "my.db")
+(save-db "my.db")   ; atomic: write a temporary file, flush, rename
 (load-db "my.db")   ; replaces all tables
 ```
+
+`save-db` writes the last committed state. A crash or an error leaves the old file whole.
 
 ## Threads
 
 One writer runs at a time. Readers take no lock. A change builds new immutable tables, then swaps them in as one step. A reader never sees a change half done, including a cascade.
 
-`save-db` writes the last committed state. It does not block writers, and it does not save the open changes of a transaction.
+`save-db` writes the last committed state. It does not save the open changes of a transaction. Writers wait only while it reads the root.
 
 ## Test
 
