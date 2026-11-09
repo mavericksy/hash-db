@@ -58,16 +58,38 @@
 
 ;; Run FN as one atomic change. The new root becomes visible only when FN returns.
 ;; If FN exits any other way, the change is dropped.
+;; Inside a transaction, this makes a savepoint. If FN exits any other way,
+;; only the changes since the savepoint are dropped.
 (defun call-with-transaction (fn)
   (if *txn*
-      (funcall fn)
+      (call-with-savepoint fn)
       (with-writer
         (let ((*txn* (make-txn (db-root *db*))))
-          (multiple-value-prog1 (funcall fn)
-            (setf (db-root *db*) (txn-root *txn*)))))))
+          (catch 'rollback
+            (multiple-value-prog1 (funcall fn)
+              (setf (db-root *db*) (txn-root *txn*))))))))
 
+(defun call-with-savepoint (fn)
+  (let ((saved (txn-root *txn*))
+        (done nil))
+    (unwind-protect
+         (catch 'rollback
+           (multiple-value-prog1 (funcall fn)
+             (setf done t)))
+      (unless done
+        (setf (txn-root *txn*) saved)))))
+
+;; Run BODY as one change. All of it happens, or none of it.
+;; Return the values of BODY.
 (defmacro with-transaction (&body body)
   `(call-with-transaction (lambda () ,@body)))
+
+;; Drop the changes of the innermost WITH-TRANSACTION and leave it.
+;; That WITH-TRANSACTION returns nil.
+(defun rollback ()
+  (unless *txn*
+    (error 'transaction-error :message "ROLLBACK called outside a transaction"))
+  (throw 'rollback nil))
 
 ;; A table is a value. Never change one. Use UPDATED-TABLE and PUT-TABLE.
 (defclass table ()
@@ -745,6 +767,7 @@
                                               (name col) (name tbl) key)))))))
 
 ;; Write all committed tables to FILE. Return FILE.
+;; Changes of an open transaction are not saved until it commits.
 ;; The save reads one fixed root, so writers do not wait for it.
 (defun save-db (file)
   (get-lock *file-lock*
@@ -756,6 +779,8 @@
 
 ;; Replace all tables with those in FILE. Return the table names.
 (defun load-db (file)
+  (when *txn*
+    (error 'transaction-error :message "Can't load a database file inside a transaction"))
   (get-lock *file-lock*
     (let ((data (cl-store:restore file)))
       (unless (and (consp data)

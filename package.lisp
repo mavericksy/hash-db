@@ -13,6 +13,8 @@
     #:make-schema #:make-col #:make-class-specific-col
     #:primary-key-column #:foreign-key-column #:interned-string
     #:timestamp #:any
+    ;; transactions
+    #:with-transaction #:rollback
     ;; rows
     #:insert-row #:get-row #:update-row #:delete-row #:row-list
     ;; queries
@@ -22,7 +24,7 @@
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
     #:no-such-table #:no-such-column #:no-such-row
-    #:schema-error #:table-exists #:invalid-row #:query-error
+    #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation
     #:file-format-error))

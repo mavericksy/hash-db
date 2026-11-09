@@ -37,6 +37,9 @@
 (define-condition query-error (hash-db-error) ()
   (:documentation "A query is not valid."))
 
+(define-condition transaction-error (hash-db-error) ()
+  (:documentation "A transaction function was used in the wrong place."))
+
 ;;; Constraints
 
 (define-condition constraint-violation (hash-db-error)

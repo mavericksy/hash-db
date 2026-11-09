@@ -537,6 +537,158 @@
   (delete-row 1 "people")
   (is (= 1 (count-rows "pets"))))
 
+;;; transactions
+
+(defun names-of (table)
+  (mapcar (lambda (r) (getf r :name)) (row-list table)))
+
+(def-test transaction-commits-all-changes (:fixture clean-db)
+  (make-people)
+  (is (= 2 (with-transaction
+             (insert-row '(:name "a") "people")
+             (insert-row '(:name "b") "people"))))
+  (is (equal '("a" "b") (names-of "people"))))
+
+(def-test transaction-returns-all-values (:fixture clean-db)
+  (is (equal '(1 2 3) (multiple-value-list (with-transaction (values 1 2 3))))))
+
+(def-test error-drops-the-whole-transaction (:fixture clean-db)
+  (make-people)
+  (handler-case (with-transaction
+                  (insert-row '(:name "a") "people")
+                  (insert-row '(:name "b") "people")
+                  (error "boom"))
+    (error () nil))
+  (is (= 0 (count-rows "people")))
+  (is (= 1 (insert-row '(:name "c") "people")) "ids of dropped rows are free again"))
+
+(def-test constraint-failure-drops-earlier-changes (:fixture clean-db)
+  (make-table "t" '((:id primary-key-column) (:u string :unique t)))
+  (insert-row '(:u "x") "t")
+  (signals unique-violation
+    (with-transaction
+      (insert-row '(:u "y") "t")
+      (insert-row '(:u "x") "t")))
+  (is (equal '("x") (mapcar (lambda (r) (getf r :u)) (row-list "t")))))
+
+(def-test non-local-exit-drops-the-transaction (:fixture clean-db)
+  (make-people)
+  (block out
+    (with-transaction
+      (insert-row '(:name "a") "people")
+      (return-from out)))
+  (is (= 0 (count-rows "people"))))
+
+(def-test transaction-reads-its-own-writes (:fixture clean-db)
+  (make-people)
+  (with-transaction
+    (insert-row '(:name "a") "people")
+    (is (equal '("a") (names-of "people")))
+    (update-row 1 '(:name "b") "people")
+    (is (equal "b" (getf (get-row 1 "people") :name)))))
+
+(def-test other-threads-see-only-committed-data (:fixture clean-db)
+  (make-people)
+  (insert-row '(:name "old") "people")
+  (flet ((count-in-other-thread ()
+           (bt:join-thread (bt:make-thread (lambda () (count-rows "people"))))))
+    (with-transaction
+      (insert-row '(:name "new") "people")
+      (is (= 2 (count-rows "people")))
+      (is (= 1 (count-in-other-thread)) "the other thread does not wait and does not see it"))
+    (is (= 2 (count-in-other-thread)))))
+
+(def-test nested-transaction-is-a-savepoint (:fixture clean-db)
+  (make-people)
+  (with-transaction
+    (insert-row '(:name "a") "people")
+    (handler-case (with-transaction
+                    (insert-row '(:name "b") "people")
+                    (error "inner"))
+      (error () nil))
+    (insert-row '(:name "c") "people"))
+  (is (equal '("a" "c") (names-of "people"))))
+
+(def-test error-after-a-handled-inner-error-drops-everything (:fixture clean-db)
+  (make-people)
+  (ignore-errors
+    (with-transaction
+      (insert-row '(:name "a") "people")
+      (handler-case (with-transaction (insert-row '(:name "b") "people") (error "inner"))
+        (error () nil))
+      (error "outer")))
+  (is (= 0 (count-rows "people"))))
+
+(def-test rollback-leaves-the-transaction (:fixture clean-db)
+  (make-people)
+  (is (null (with-transaction
+              (insert-row '(:name "a") "people")
+              (rollback)
+              (insert-row '(:name "b") "people"))))
+  (is (= 0 (count-rows "people"))))
+
+(def-test rollback-only-leaves-the-innermost-transaction (:fixture clean-db)
+  (make-people)
+  (with-transaction
+    (insert-row '(:name "a") "people")
+    (with-transaction
+      (insert-row '(:name "b") "people")
+      (rollback))
+    (insert-row '(:name "c") "people"))
+  (is (equal '("a" "c") (names-of "people"))))
+
+(def-test rollback-outside-a-transaction-is-an-error (:fixture clean-db)
+  (signals transaction-error (rollback)))
+
+(def-test transaction-spans-tables (:fixture clean-db)
+  (make-people)
+  (make-pets)
+  (with-transaction
+    (let ((owner (insert-row '(:name "ann") "people")))
+      (insert-row (list :owner owner :pet "rex") "pets")))
+  (is (= 1 (count-rows "people")))
+  (is (= 1 (count-rows "pets")))
+  (ignore-errors
+    (with-transaction
+      (insert-row '(:name "bob") "people")
+      (insert-row '(:owner 99 :pet "x") "pets")))
+  (is (= 1 (count-rows "people")) "the new owner is dropped with the failed pet"))
+
+(def-test table-changes-roll-back (:fixture clean-db)
+  (make-people)
+  (ignore-errors
+    (with-transaction
+      (make-table "extra" '((:a number)))
+      (drop-table "people")
+      (error "boom")))
+  (is (equal '("people") (show-tables)))
+  (is (equal '(:id :name :age :active) (mapcar #'name (schema (find-table "people")))))
+  (ignore-errors
+    (with-transaction
+      (add-column (find-table "people") '(:city string))
+      (error "boom")))
+  (is (= 4 (length (schema (find-table "people"))))))
+
+(def-test load-is-not-allowed-inside-a-transaction (:fixture clean-db)
+  (make-people)
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (signals transaction-error (with-transaction (load-db path))))))
+
+(def-test transactions-do-not-lose-updates (:fixture clean-db)
+  (make-table "c" '((:id primary-key-column) (:n integer :default 0)))
+  (insert-row '() "c")
+  (let ((threads (loop repeat 4
+                       collect (bt:make-thread
+                                 (lambda ()
+                                   (loop repeat 50
+                                         do (with-transaction
+                                              (update-row 1 (list :n (1+ (getf (get-row 1 "c") :n)))
+                                                          "c"))))))))
+    (mapc #'bt:join-thread threads))
+  (is (= 200 (getf (get-row 1 "c") :n))))
+
 ;;; select
 
 (def-test select-all-rows (:fixture clean-db)
