@@ -189,16 +189,20 @@
 (defun rows-list (rows)
   (mapcar #'cdr (fset:convert 'list rows)))
 
+;; The root holds tables, and other named things that features add, such as
+;; sequences and views. They share one namespace. These functions see tables only.
+(defun all-tables (&optional (root (current-root)))
+  (loop for name in (fset:convert 'list (fset:domain root))
+        for object = (values (fset:lookup root name))
+        when (typep object 'table) collect object))
+
 (defun show-tables ()
-  (fset:convert 'list (fset:domain (current-root))))
+  (mapcar #'name (all-tables)))
 
 ;; Return a table of NAME, or nil
 (defun get-named-table (name)
-  (values (fset:lookup (current-root) name)))
-
-(defun all-tables (&optional (root (current-root)))
-  (mapcar #'(lambda (name) (values (fset:lookup root name)))
-          (fset:convert 'list (fset:domain root))))
+  (let ((object (values (fset:lookup (current-root) name))))
+    (and (typep object 'table) object)))
 
 ;; Accept a table name or a table value (for example a select result).
 (defun find-table (designator)
@@ -909,11 +913,11 @@
 ;;; Persistence. A file holds plain data: table names, row ids, rows and
 ;;; column specs. Locks and functions are rebuilt on load.
 
-(defparameter +file-format-version+ 4)
+(defparameter +file-format-version+ 5)
 
 ;; Files of these versions can be read. Version 4 added the indexes that
-;; CREATE-INDEX made. A version 3 file has none.
-(defparameter +readable-file-versions+ '(3 4))
+;; CREATE-INDEX made. Version 5 added sections for features. An older file has none.
+(defparameter +readable-file-versions+ '(3 4 5))
 
 (defun table-snapshot (tbl)
   (list (name tbl)
@@ -964,7 +968,7 @@
 ;;; Replay. Apply journal entries to a root and return the new root. Entries
 ;;; were checked when they first ran, so replay does not check them again.
 
-(defun replay-entry (root entry)
+(defun replay-table-entry (root entry)
   (flet ((table-named (name)
            (or (values (fset:lookup root name))
                (error 'persistence-error
@@ -1007,6 +1011,31 @@
                        (updated-table tbl
                                       :schema (append (schema tbl) (list (apply #'make-col spec)))
                                       :rows (fset:convert 'fset:map id-rows))))))))))
+
+;;; Extending replay and snapshots
+;;;
+;;; A feature that adds named things to the root registers three things here: how
+;;; to replay its log entries, how to save its things in a snapshot and restore them,
+;;; and what must be true before a save.
+
+(defvar *replay-handlers* (make-hash-table :test 'eq))
+
+;; Define how to replay an entry (kind . args). BODY returns the new root.
+(defmacro define-replay (kind (root &rest args) &body body)
+  `(setf (gethash ,kind *replay-handlers*)
+         (lambda (,root entry)
+           (declare (ignorable entry))
+           (destructuring-bind ,args (rest entry) ,@body))))
+
+(defun replay-entry (root entry)
+  (let ((handler (gethash (first entry) *replay-handlers*)))
+    (cond (handler (funcall handler root entry))
+          ((member (first entry) '(:create-table :drop-table :insert :update :delete
+                                   :create-index :drop-index :add-column))
+           (replay-table-entry root entry))
+          (t (error 'persistence-error
+                    :message (format nil "Unknown log entry ~S. The log may come from a newer version."
+                                     (first entry)))))))
 
 (defun replay-entries (root entries)
   (dolist (entry entries root)
@@ -1059,13 +1088,34 @@
     (values (db-root *db*) (db-seq *db*))))
 
 ;; Write the tables of ROOT to FILE as the state after transaction SEQ.
+(defvar *snapshot-sections* '())
+
+;; Save and restore the things of one feature. SAVER takes the root and returns data.
+;; RESTORER takes a root and the data and returns the new root. Sections run in the order
+;; they were registered.
+(defun register-snapshot-section (key saver restorer)
+  (let ((existing (assoc key *snapshot-sections*)))
+    (if existing
+        (setf (cdr existing) (list saver restorer))
+        (setf *snapshot-sections* (append *snapshot-sections* (list (list key saver restorer)))))))
+
+(defvar *save-checks* '())
+
+;; CHECK takes the root and signals persistence-error if it holds something a file can't keep.
+(defun register-save-check (check)
+  (pushnew check *save-checks*))
+
 (defun write-snapshot (file root seq)
   (let ((tables (all-tables root)))
     (check-savable tables)
+    (dolist (check *save-checks*)
+      (funcall check root))
     (call-with-atomic-file
      file
      #'(lambda (tmp)
-         (cl-store:store (list :hash-db +file-format-version+ seq (mapcar #'table-snapshot tables))
+         (cl-store:store (list :hash-db +file-format-version+ seq (mapcar #'table-snapshot tables)
+                               (loop for (key saver) in *snapshot-sections*
+                                     append (list key (funcall saver root))))
                          tmp)))
     file))
 
@@ -1085,6 +1135,10 @@
       (let ((root (fset:empty-map)))
         (dolist (tbl (mapcar #'restore-table (fourth data)))
           (setf root (fset:with root (name tbl) tbl)))
+        (loop for (key nil restorer) in *snapshot-sections*
+              for sections = (fifth data)
+              when (member key sections)
+                do (setf root (funcall restorer root (getf sections key))))
         (values root (third data))))))
 
 ;; Write all committed tables to FILE. Return FILE.
