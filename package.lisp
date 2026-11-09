@@ -30,7 +30,7 @@
     #:save-db #:load-db #:open-db #:close-db #:checkpoint
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
-    #:no-such-table #:no-such-column #:no-such-row #:no-such-sequence #:no-such-view #:error-name
+    #:no-such-table #:no-such-column #:no-such-row #:no-such-sequence #:error-name
     #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation
