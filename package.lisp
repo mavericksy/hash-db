@@ -12,6 +12,7 @@
     ;; schema and columns
     #:make-schema #:make-col #:make-class-specific-col
     #:primary-key-column #:foreign-key-column #:interned-string
+    #:timestamp #:any
     ;; rows
     #:insert-row #:get-row #:update-row #:delete-row #:row-list
     ;; queries
@@ -22,5 +23,5 @@
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
     #:no-such-table #:no-such-column #:no-such-row
     #:schema-error #:table-exists #:invalid-row #:query-error
-    #:constraint-violation #:not-null-violation #:foreign-key-violation
+    #:constraint-violation #:not-null-violation #:type-mismatch #:foreign-key-violation
     #:file-format-error))

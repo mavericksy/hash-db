@@ -45,6 +45,7 @@
   (:documentation "A change would break a rule of the schema."))
 
 (define-condition not-null-violation (constraint-violation) ())
+(define-condition type-mismatch (constraint-violation) ())
 (define-condition foreign-key-violation (constraint-violation) ())
 
 ;;; Files

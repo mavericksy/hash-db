@@ -91,18 +91,22 @@
 (defun create-table-instance (name schema)
   (make-instance 'table :name name :schema schema :lock (bt:make-lock (princ-to-string name))))
 
-(defun not-nullable (val col)
-  (or val (error 'not-null-violation :column (name col)
-                      :message (format nil "Column ~A can't be null" (name col)))))
+;;; NULL is the keyword :null, so it never mixes up with false (nil).
+(defun null-value-p (val)
+  (eq val :null))
 
 (defun keep-value (val col)
   (declare (ignore col))
   val)
 
+(defun to-double (val col)
+  (declare (ignore col))
+  (coerce val 'double-float))
+
 (defclass column ()
   ((name                :reader name
                         :initarg                    :name)
-   ;; (name type default-value references), used to rebuild the column on load
+   ;; (name type . options), used to rebuild the column on load
    (spec                :reader spec
                         :initarg                    :spec
                         :initform nil)
@@ -112,9 +116,16 @@
    (comparator          :reader comparator
                         :initarg                    :comparator
                         :initform nil)
-   (default-value       :reader default-value
-                        :initarg                    :default-value
+   ;; a CL type specifier. Every value that is not NULL must match it.
+   (value-type          :reader value-type
+                        :initarg                    :value-type
+                        :initform t)
+   (not-null            :reader not-null-p
+                        :initarg                    :not-null
                         :initform nil)
+   (default-value       :reader default-value
+                        :initarg                    :default
+                        :initform :null)
    (value-normaliser    :reader value-normaliser
                         :initarg                    :value-normaliser
                         :initform #'keep-value))
@@ -122,7 +133,7 @@
 
 (defclass primary-key-column (column)
   ((equality-predicate :initform #'=)
-   (value-normaliser   :initform #'not-nullable)))
+   (not-null           :initform t)))
 
 (defclass foreign-key-column (column)
   ((references         :reader references
@@ -130,24 +141,44 @@
                        :initform nil)
    (foreign-column     :reader foreign-column
                        :initform :primary-key)
-   (equality-predicate :initform #'=)
-   (value-normaliser   :initform #'not-nullable)))
+   (equality-predicate :initform #'=)))
+
+(defclass interned-values-column (column)
+  ((interned-values    :reader interned-values
+                       :initform (create-hash-table))
+   (equality-predicate :initform #'eql)
+   (not-null           :initform t)
+   (value-normaliser   :initform #'intern-for-column)))
 
 (defmethod initialize-instance :after ((col foreign-key-column) &key)
   (unless (references col)
     (error 'schema-error
            :message (format nil "Must supply a reference table for the foreign key column ~A." (name col)))))
 
-(defclass interned-values-column (column)
-  ((interned-values    :reader interned-values
-                       :initform (create-hash-table))
-   (equality-predicate :initform #'eql)
-   (value-normaliser   :initform #'intern-for-column)))
+;; A default value must pass the same checks as any other value.
+(defmethod initialize-instance :after ((col column) &key)
+  (unless (null-value-p (default-value col))
+    (normalise-for-col (default-value col) col)))
 
 (defun intern-for-column (val col)
   (let ((hash (interned-values col)))
-    (or (gethash (not-nullable val col) hash)
+    (or (gethash val hash)
         (setf (gethash val hash) val))))
+
+;; Check a value against a column. NULL passes unless the column is not null.
+;; Other values must match the column type, then the normaliser may change them.
+(defun normalise-for-col (val col)
+  (cond ((null-value-p val)
+         (when (not-null-p col)
+           (error 'not-null-violation :column (name col)
+                  :message (format nil "Column ~A can't be null" (name col))))
+         val)
+        ((typep val (value-type col))
+         (funcall (value-normaliser col) val col))
+        (t
+         (error 'type-mismatch :column (name col)
+                :message (format nil "Column ~A expects ~A, got ~S"
+                                 (name col) (value-type col) val)))))
 
 ;; A foreign key value must be the id of a row in the referenced table.
 (defun check-foreign-key (table-name fk)
@@ -158,62 +189,111 @@
                :message (format nil "Foreign key constraint violation: no row ~A in table ~A"
                                 fk table-name)))))
 
-(defgeneric make-col (name type &optional default-value references))
+(defgeneric make-col (name type &rest options))
 
-(defmethod make-col (name type &optional default-value references)
-  (declare (ignore name default-value references))
+(defmethod make-col (name type &rest options)
+  (declare (ignore name options))
   (error 'schema-error :message (format nil "Unknown column type: ~A" type)))
 
-;; Create a class specific column to store instances of that class
+(defun check-column-options (type options allowed)
+  (unless (evenp (length options))
+    (error 'schema-error
+           :message (format nil "Column options must be :key value pairs: ~S" options)))
+  (iter (for key in options by #'cddr)
+        (unless (member key allowed)
+          (error 'schema-error
+                 :message (format nil "Unknown option ~S for column type ~A. Allowed: ~S"
+                                  key type allowed)))))
+
+;; Create a class specific column to store instances of that class.
+;; Columns are made with (make-col name type :option value ...)
 ;;
 (defmacro make-class-specific-col (&key type
                                    class
+                                   (value-type       t)
                                    (comparator       nil comparator-p)
                                    (eq-pred          nil eq-pred-p)
                                    (val-norm         nil val-norm-p)
-                                   (references       nil references-p))
-  (declare (ignore references))
-  `(defmethod make-col (name (type (eql ',type)) &optional default-value references)
-     (declare (ignorable type references))
-     (make-instance
-       ',class
-       :name (as-keyword name)
-       :spec (list (as-keyword name) ',type default-value references)
-       ,@(when comparator-p       `(:comparator ,comparator))
-       ,@(when eq-pred-p          `(:equality-predicate ,eq-pred))
-       ,@(when val-norm-p         `(:value-normaliser ,val-norm))
-       ,@(when references-p       `(:references references))
-       :default-value default-value)))
+                                   (extra-options    nil))
+  `(defmethod make-col (name (type (eql ',type)) &rest options)
+     (declare (ignorable type))
+     (check-column-options ',type options '(:default ,@extra-options))
+     (apply #'make-instance
+            ',class
+            :name (as-keyword name)
+            :spec (list* (as-keyword name) ',type options)
+            :value-type ',value-type
+            ,@(when comparator-p       `(:comparator ,comparator))
+            ,@(when eq-pred-p          `(:equality-predicate ,eq-pred))
+            ,@(when val-norm-p         `(:value-normaliser ,val-norm))
+            options)))
 
 
 ;; A couple default column definitions
 ;;
 (make-class-specific-col :class column
                          :type boolean
+                         :value-type boolean
                          :comparator #'(lambda (a b) (and (not a) b))
                          :eq-pred #'eq)
 
 (make-class-specific-col :class primary-key-column
                          :type primary-key-column
+                         :value-type integer
                          :comparator #'<)
 
 (make-class-specific-col :class foreign-key-column
                          :type foreign-key-column
+                         :value-type integer
                          :comparator #'<
-                         :references t)
+                         :extra-options (:references))
 
 (make-class-specific-col :class column
                          :type string
+                         :value-type string
                          :comparator #'string<
                          :eq-pred #'string=)
 
 (make-class-specific-col :class column
                          :type number
+                         :value-type real
                          :comparator #'<
                          :eq-pred #'=)
 
+(make-class-specific-col :class column
+                         :type integer
+                         :value-type integer
+                         :comparator #'<
+                         :eq-pred #'=)
+
+;; Any real number is accepted and stored as a double-float.
+(make-class-specific-col :class column
+                         :type float
+                         :value-type real
+                         :comparator #'<
+                         :eq-pred #'=
+                         :val-norm #'to-double)
+
+;; Universal time: whole seconds since 1900-01-01 UTC.
+(make-class-specific-col :class column
+                         :type timestamp
+                         :value-type (integer 0)
+                         :comparator #'<
+                         :eq-pred #'=)
+
+(make-class-specific-col :class column
+                         :type keyword
+                         :value-type keyword
+                         :comparator #'string<
+                         :eq-pred #'eq)
+
+;; Any Lisp object. Values are compared with EQUAL and can't be sorted.
+(make-class-specific-col :class column
+                         :type any)
+
 (make-class-specific-col :class interned-values-column
                          :type interned-string
+                         :value-type string
                          :comparator #'string<)
 
 (defun make-schema (spec)
@@ -235,14 +315,12 @@
     (validate-schema name schema)
     (add-table-to-global (create-table-instance name schema) name)))
 
-;; Value for COL as stored: foreign keys must exist, then the column normaliser runs.
+;; Value for COL as stored: type and null checks run, then a foreign key must exist.
 (defun resolve-column-value (col val)
-  (when (typep col 'foreign-key-column)
-    (check-foreign-key (references col) val))
-  (normalise-for-col val col))
-
-(defun normalise-for-col (val col)
-  (funcall (value-normaliser col) val col))
+  (let ((normalised (normalise-for-col val col)))
+    (when (and (typep col 'foreign-key-column) (not (null-value-p normalised)))
+      (check-foreign-key (references col) normalised))
+    normalised))
 
 (defun find-column (col-name schema)
   (or (find (as-keyword col-name) schema :key #'name)
@@ -389,9 +467,11 @@
                :message (format nil "Can't join: both tables have columns named ~A" clash)))
       (values (loop for a in rows
                     nconc (loop for b in other-rows
-                                when (funcall (equality-predicate here-col)
-                                              (getf a (name here-col))
-                                              (getf b (name there-col)))
+                                when (let ((x (getf a (name here-col)))
+                                           (y (getf b (name there-col))))
+                                       (and (not (null-value-p x))
+                                            (not (null-value-p y))
+                                            (funcall (equality-predicate here-col) x y)))
                                   collect (append a b)))
               (append schema (schema other))))))
 
@@ -405,9 +485,15 @@
     #'(lambda (a b)
         (iter (for name in names)
               (for test in tests)
-              (always (funcall test (getf a name) (getf b name)))))))
+              (always (let ((x (getf a name))
+                            (y (getf b name)))
+                        ;; two NULLs count as equal here, so DISTINCT keeps one
+                        (cond ((and (null-value-p x) (null-value-p y)) t)
+                              ((or (null-value-p x) (null-value-p y)) nil)
+                              (t (funcall test x y)))))))))
 
 ;; True when row A sorts before row B. The first column that differs decides.
+;; NULL sorts after every other value.
 (defun row-comparator (col-names schema)
   (let* ((names (mapcar #'as-keyword col-names))
          (comparators (mapcar #'(lambda (col)
@@ -420,20 +506,26 @@
               for comp in comparators
               do (let ((a-v (getf a name))
                        (b-v (getf b name)))
-                   (cond ((funcall comp a-v b-v) (return t))
+                   (cond ((and (null-value-p a-v) (null-value-p b-v)))
+                         ((null-value-p a-v) (return nil))
+                         ((null-value-p b-v) (return t))
+                         ((funcall comp a-v b-v) (return t))
                          ((funcall comp b-v a-v) (return nil))))
               finally (return nil)))))
 
 (defun column-matcher (col val)
   (let ((name (name col))
-        (predicate (equality-predicate col))
-        (normalised (normalise-for-col val col)))
-    #'(lambda (row)
-        (let ((row-val (getf row name)))
-          ;; a null column value never matches a given value
-          (and row-val (funcall predicate row-val normalised))))))
+        (predicate (equality-predicate col)))
+    (if (null-value-p val)
+        #'(lambda (row) (null-value-p (getf row name)))
+        (let ((normalised (normalise-for-col val col)))
+          #'(lambda (row)
+              (let ((row-val (getf row name)))
+                ;; a NULL column value never matches a given value
+                (and (not (null-value-p row-val))
+                     (funcall predicate row-val normalised))))))))
 
-;; A nil value means "any value".
+;; A nil value means "any value". The value :null matches rows where the column is NULL.
 (defun column-matchers (schema names-and-values)
   (iter (for (name val) on names-and-values by #'cddr)
         (when val
@@ -447,7 +539,7 @@
 ;;; Persistence. A file holds plain data: table names, row ids, rows and
 ;;; column specs. Locks and functions are rebuilt on load.
 
-(defparameter +file-format-version+ 1)
+(defparameter +file-format-version+ 2)
 
 (defun table-snapshot (tbl)
   (get-lock (lock tbl)

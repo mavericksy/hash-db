@@ -16,7 +16,7 @@
 
 (defun make-pets ()
   (make-table "pets" '((:id primary-key-column)
-                       (:owner foreign-key-column nil "people")
+                       (:owner foreign-key-column :references "people")
                        (:pet string))))
 
 (defun add-people ()
@@ -85,7 +85,7 @@
 (def-test add-column-backfills-default (:fixture clean-db)
   (make-people)
   (add-people)
-  (add-column (find-table "people") '(:city string "paris"))
+  (add-column (find-table "people") '(:city string :default "paris"))
   (is (equal "paris" (getf (get-row 1 "people") :city)))
   (insert-row '(:name "dan" :age 1 :active nil) "people")
   (is (equal "paris" (getf (get-row 4 "people") :city)))
@@ -99,12 +99,12 @@
   (is (equal '(:id 2 :name "bob" :age 25 :active nil) (get-row 2 "people"))))
 
 (def-test insert-uses-column-defaults (:fixture clean-db)
-  (make-table "t" '((:id primary-key-column) (:n number 7)))
+  (make-table "t" '((:id primary-key-column) (:n number :default 7)))
   (insert-row '() "t")
   (is (= 7 (getf (get-row 1 "t") :n))))
 
 (def-test false-boolean-is-stored (:fixture clean-db)
-  (make-table "t" '((:flag boolean t)))
+  (make-table "t" '((:flag boolean :default t)))
   (insert-row '(:flag nil) "t")
   (is (eq nil (getf (get-row 1 "t") :flag)))
   (is (eq t (getf (progn (insert-row '() "t") (get-row 2 "t")) :flag))))
@@ -166,8 +166,14 @@
   (make-people)
   (make-pets)
   (add-people)
-  (signals foreign-key-violation (insert-row '(:owner 99 :pet "rex") "pets"))
-  (signals foreign-key-violation (insert-row '(:pet "rex") "pets")))
+  (signals foreign-key-violation (insert-row '(:owner 99 :pet "rex") "pets")))
+
+(def-test foreign-key-may-be-null (:fixture clean-db)
+  (make-people)
+  (make-pets)
+  (add-people)
+  (insert-row '(:pet "rex") "pets")
+  (is (eq :null (getf (get-row 1 "pets") :owner))))
 
 (def-test foreign-key-to-a-missing-table-is-rejected (:fixture clean-db)
   (make-pets)
@@ -180,6 +186,107 @@
   (insert-row '(:owner 1 :pet "rex") "pets")
   (finishes (update-row 1 '(:owner 2) "pets"))
   (signals foreign-key-violation (update-row 1 '(:owner 99) "pets")))
+
+;;; NULL and types
+
+(def-test missing-value-is-null-not-false (:fixture clean-db)
+  (make-people)
+  (insert-row '(:name "ann") "people")
+  (insert-row '(:name "bob" :active nil) "people")
+  (is (eq :null (getf (get-row 1 "people") :active)))
+  (is (eq nil (getf (get-row 2 "people") :active)))
+  (is (eq :null (getf (get-row 1 "people") :age))))
+
+(def-test values-must-match-the-column-type (:fixture clean-db)
+  (make-table "t" '((:s string) (:n number) (:i integer) (:b boolean)
+                    (:k keyword) (:ts timestamp)))
+  (signals type-mismatch (insert-row '(:s 1) "t"))
+  (signals type-mismatch (insert-row '(:n "x") "t"))
+  (signals type-mismatch (insert-row '(:i 1.5) "t"))
+  (signals type-mismatch (insert-row '(:b 1) "t"))
+  (signals type-mismatch (insert-row '(:k "x") "t"))
+  (signals type-mismatch (insert-row '(:ts -1) "t"))
+  (finishes (insert-row (list :s "a" :n 1.5 :i 2 :b nil :k :red :ts (get-universal-time)) "t")))
+
+(def-test type-is-checked-on-update (:fixture clean-db)
+  (make-people)
+  (add-people)
+  (signals type-mismatch (update-row 1 '(:age "old") "people"))
+  (is (= 30 (getf (get-row 1 "people") :age))))
+
+(def-test null-is-accepted-by-every-type (:fixture clean-db)
+  (make-table "t" '((:s string) (:n number) (:b boolean)))
+  (finishes (insert-row '(:s :null :n :null :b :null) "t")))
+
+(def-test float-column-stores-double-floats (:fixture clean-db)
+  (make-table "t" '((:f float)))
+  (insert-row '(:f 1) "t")
+  (insert-row '(:f 1/2) "t")
+  (is (eql 1d0 (getf (get-row 1 "t") :f)))
+  (is (eql 0.5d0 (getf (get-row 2 "t") :f))))
+
+(def-test any-column-takes-any-object (:fixture clean-db)
+  (make-table "t" '((:x any)))
+  (insert-row '(:x (1 "two" :three)) "t")
+  (is (equal '(1 "two" :three) (getf (get-row 1 "t") :x))))
+
+(def-test bad-default-is-rejected-at-definition (:fixture clean-db)
+  (signals type-mismatch (make-table "t" '((:n number :default "x")))))
+
+(def-test bad-column-options-are-rejected (:fixture clean-db)
+  (signals schema-error (make-table "t" '((:n number :colour "red"))))
+  (signals schema-error (make-table "t" '((:n number :default))))
+  (signals schema-error (make-table "t" '((:n number :references "people")))))
+
+(def-test matching-null (:fixture clean-db)
+  (make-people)
+  (insert-row '(:name "ann" :age 30) "people")
+  (insert-row '(:name "bob") "people")
+  (is (equal '("bob")
+             (mapcar (lambda (r) (getf r :name))
+                     (row-list (select :from "people"
+                                       :where (matching "people" :age :null))))))
+  (is (equal '("ann")
+             (mapcar (lambda (r) (getf r :name))
+                     (row-list (select :from "people"
+                                       :where (matching "people" :age 30)))))
+      "a NULL value never matches a given value"))
+
+(def-test matching-a-false-boolean-row-value (:fixture clean-db)
+  (make-people)
+  (add-people)
+  (is (= 2 (length (row-list (select :from "people"
+                                     :where (matching "people" :active t)))))))
+
+(def-test null-sorts-last (:fixture clean-db)
+  (make-people)
+  (insert-row '(:name "x") "people")
+  (insert-row '(:name "y" :age 5) "people")
+  (insert-row '(:name "z" :age 1) "people")
+  (is (equal '("z" "y" "x")
+             (mapcar (lambda (r) (getf r :name))
+                     (row-list (select :from "people" :order-by :age))))))
+
+(def-test distinct-treats-nulls-as-equal (:fixture clean-db)
+  (make-people)
+  (insert-row '(:name "a") "people")
+  (insert-row '(:name "b") "people")
+  (insert-row '(:name "c" :age 1) "people")
+  (is (equal '((:age :null) (:age 1))
+             (row-list (select :from "people" :col :age :distinct t)))))
+
+(def-test join-never-matches-nulls (:fixture clean-db)
+  (make-people)
+  (make-table "pets" '((:pet-id primary-key-column)
+                       (:owner foreign-key-column :references "people")
+                       (:pet string)))
+  (add-people)
+  (insert-row '(:pet "stray") "pets")
+  (insert-row '(:owner 1 :pet "rex") "pets")
+  (is (equal '((:pet "rex"))
+             (row-list (select :from "pets"
+                               :inner-join '("people" :owner :id)
+                               :col :pet)))))
 
 ;;; select
 
@@ -271,7 +378,7 @@
 (def-test select-inner-join (:fixture clean-db)
   (make-people)
   (make-table "pets" '((:pet-id primary-key-column)
-                       (:owner foreign-key-column nil "people")
+                       (:owner foreign-key-column :references "people")
                        (:pet string)))
   (add-people)
   (insert-row '(:owner 1 :pet "rex") "pets")
