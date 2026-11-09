@@ -540,3 +540,68 @@
   (is (= 3 (delete-where "plain" :where '(and (>= :price 10) (<= :price 16)))))
   (is (equalp (mapcar #'without-sku (row-list "items")) (mapcar #'without-sku (row-list "plain"))))
   (is (indexes-match-rows-p)))
+
+;;; Joins find their partners without trying every pair
+
+;; The plain way: try every pair.
+(defun reference-join (left right kind left-schema-names right-schema-names lname rname test)
+  (let ((matched (make-array (length right) :initial-element nil))
+        (null-left (loop for n in left-schema-names append (list n :null)))
+        (null-right (loop for n in right-schema-names append (list n :null)))
+        (result '()))
+    (dolist (l left)
+      (let ((hit nil))
+        (loop for r in right
+              for i from 0
+              do (let ((x (getf l lname)) (y (getf r rname)))
+                   (when (and (not (eq x :null)) (not (eq y :null)) (funcall test x y))
+                     (setf hit t (aref matched i) t)
+                     (push (append l r) result))))
+        (when (and (not hit) (member kind '(:left :full)))
+          (push (append l null-right) result))))
+    (when (member kind '(:right :full))
+      (loop for r in right
+            for i from 0
+            unless (aref matched i) do (push (append null-left r) result)))
+    (nreverse result)))
+
+(defun check-join-against-reference (type values indexed seed)
+  (make-table "l" `((:id primary-key-column) (:lk ,type)))
+  (make-table "r" `((:rid primary-key-column) (:rk ,type)))
+  (when indexed (create-index "r" :rk))
+  ;; With an index and few rows on the left, the join reads the index. Otherwise it
+  ;; builds a hash table. Both are checked.
+  (let ((rs (sb-ext:seed-random-state seed))
+        (left-count (if indexed 8 40))
+        (right-count (if indexed 80 40)))
+    (dotimes (i left-count)
+      (insert-row (if (zerop (random 6 rs)) '() (list :lk (nth (random (length values) rs) values))) "l"))
+    (dotimes (i right-count)
+      (insert-row (if (zerop (random 6 rs)) '() (list :rk (nth (random (length values) rs) values))) "r")))
+  (dolist (kind '(:inner :left :right :full))
+    (is (equalp (reference-join (row-list "l") (row-list "r") kind '(:id :lk) '(:rid :rk) :lk :rk
+                                (if (eq type 'string) #'string= #'=))
+                (row-list (select :from "l" :joins `((,kind "r" :lk :rk)))))
+        "~A join of ~A, index ~A" kind type indexed))
+  (drop-table "l")
+  (drop-table "r"))
+
+(def-test joins-match-the-plain-way-with-numbers (:fixture clean-db)
+  (dolist (indexed '(nil t))
+    (check-join-against-reference 'number '(1 2 3 1.0 2.0 1/2 0.5 7 3) indexed 11)))
+
+(def-test joins-match-the-plain-way-with-strings (:fixture clean-db)
+  (dolist (indexed '(nil t))
+    (check-join-against-reference 'string '("a" "b" "A" "" "ab" "c") indexed 12)))
+
+(def-test join-through-an-index-reads-the-index (:fixture clean-db)
+  (make-pet-world)
+  (is (equal '(:owner-fk) (index-names "pets")))
+  (is (equal '(("ann" "rex") ("ann" "tom") ("bob" :null) ("cat" "kit"))
+             (joined :from "people" :left-join '("pets" :id :owner)))))
+
+(def-test join-with-a-prefix-through-an-index (:fixture clean-db)
+  (make-pet-world)
+  (is (equal '((:name "ann" :p.pet "rex") (:name "ann" :p.pet "tom") (:name "cat" :p.pet "kit"))
+             (row-list (select :from "people" :inner-join '("pets" :id :owner :as "p")
+                               :col '(:name :p.pet))))))

@@ -380,42 +380,72 @@
                              (schema other)))
            (there-name (name (find-column (if as (prefixed-name as (name there-col)) (name there-col))
                                           other-schema)))
-           (other-rows (if as
-                           (mapcar #'(lambda (row)
-                                       (loop for (key value) on row by #'cddr
-                                             append (list (prefixed-name as key) value)))
-                                   (row-list other))
-                           (row-list other)))
+           (rename (if as
+                       #'(lambda (row)
+                           (loop for (key value) on row by #'cddr
+                                 append (list (prefixed-name as key) value)))
+                       #'identity))
            (clash (intersection (mapcar #'name schema) (mapcar #'name other-schema))))
       (when clash
         (error 'query-error
                :message (format nil "Can't join: both tables have columns named ~A. Give ~A an :as prefix."
                                 clash other-name)))
-      (let* ((others (coerce other-rows 'vector))
-             (matched (make-array (length others) :initial-element nil))
-             (null-others (null-row other-schema))
-             (null-here (null-row schema))
-             (equal-p (equality-predicate here-col))
-             (result '()))
-        (dolist (row rows)
-          (let ((x (getf row (name here-col)))
-                (hit nil))
-            (unless (null-value-p x)
-              (loop for other-row across others
-                    for i from 0
-                    do (let ((y (getf other-row there-name)))
-                         (when (and (not (null-value-p y)) (funcall equal-p x y))
-                           (setf hit t
-                                 (aref matched i) t)
-                           (push (append row other-row) result)))))
-            (when (and (not hit) (member kind '(:left :full)))
-              (push (append row null-others) result))))
-        (when (member kind '(:right :full))
-          (loop for other-row across others
-                for i from 0
-                unless (aref matched i)
-                  do (push (append null-here other-row) result)))
-        (values (nreverse result) (append schema other-schema))))))
+      (join-matches rows schema kind (name here-col) other other-schema there-name there-col rename))))
+
+;;; How rows find their partners. Rows of the two tables join where the two values
+;;; are equal, and NULL never matches. Two ways to find them, both without trying
+;;; every pair:
+;;;   - an index on the joined column, when the join is inner or left and fewer
+;;;     than a quarter as many rows look as the joined table holds. Each row looks
+;;;     up its partners in the index, and nothing is built.
+;;;   - a hash table over the joined table, built once for the query. Right and full
+;;;     joins need it, because they also report the rows that nobody matched.
+;;; Rows come out in the order of the first table, and the partners of one row in the
+;;; order of the joined table, as a nested loop would give them. A joined row that no
+;;; row matched comes last.
+
+(defun join-matches (rows schema kind here-name other other-schema there-name there-col rename)
+  (let* ((index (and (member kind '(:inner :left))
+                     ;; Building the hash table costs one pass over the joined table.
+                     ;; Looking up in the index costs more per row, so it pays only
+                     ;; when few rows look.
+                     (< (* 4 (length rows)) (fset:size (rows other)))
+                     (table-index-for other (name there-col))))
+         (others (unless index
+                   (coerce (mapcar rename (row-list other)) 'vector)))
+         (positions (unless index
+                      (let ((table (make-hash-table :test 'equal)))
+                        (loop for other-row across others
+                              for i from 0
+                              for y = (getf other-row there-name)
+                              unless (null-value-p y)
+                                do (push i (gethash (distinct-key y) table)))
+                        table)))
+         (matched (unless index (make-array (length others) :initial-element nil)))
+         (null-others (null-row other-schema))
+         (null-here (null-row schema))
+         (result '()))
+    (dolist (row rows)
+      (let* ((x (getf row here-name))
+             (hits (cond ((null-value-p x) nil)
+                         (index
+                          (mapcar #'(lambda (id) (funcall rename (fset:lookup (rows other) id)))
+                                  (index-ids index x)))
+                         (t
+                          (let ((found (reverse (gethash (distinct-key x) positions))))
+                            (dolist (i found)
+                              (setf (aref matched i) t))
+                            (mapcar #'(lambda (i) (aref others i)) found))))))
+        (dolist (other-row hits)
+          (push (append row other-row) result))
+        (when (and (null hits) (member kind '(:left :full)))
+          (push (append row null-others) result))))
+    (when (member kind '(:right :full))
+      (loop for other-row across others
+            for i from 0
+            unless (aref matched i)
+              do (push (append null-here other-row) result)))
+    (values (nreverse result) (append schema other-schema))))
 
 (defun row-equality-tester (schema)
   (let ((names (mapcar #'name schema))
