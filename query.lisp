@@ -687,3 +687,85 @@
            (ids (matching-row-ids tbl where (compile-where where (schema tbl)))))
       (count-if #'identity
                 (mapcar #'(lambda (id) (delete-row id table)) ids)))))
+
+;;; Explain
+;;;
+;;; EXPLAIN takes the same arguments as SELECT and returns the steps SELECT would take,
+;;; without running the query. The access step reads the index it would use, so its row
+;;; count is exact. Later steps do not run, so they have no counts.
+;;;
+;;; Each step is a list that starts with :step and a kind:
+;;;   (:step :scan :table t :access :full-scan :rows n :reason r)
+;;;   (:step :scan :table t :access :index :index i :column c :op o :rows n)
+;;;   (:step :join :kind k :table t :on (here there) :method m :index i)
+;;;   (:step :filter :where w)
+;;;   (:step :group :by exprs :having h)
+;;;   (:step :sort :keys keys)         each key is (:key e :direction d :nulls n)
+;;;   (:step :project :columns names)
+;;;   (:step :distinct)
+;;;   (:step :limit :limit n :offset m)
+;;; The access step says :reason when a :where did not use an index: :function,
+;;; :right-or-full-join or :no-index-condition. A join method is :index, :hash, or
+;;; :index-or-hash when it depends on how many rows reach the join. Only the first
+;;; join knows that.
+
+(defun item-names (col)
+  (loop for spec in (cond ((eq col t) nil)
+                          ((keywordp col) (list col))
+                          (t col))
+        for position from 1
+        collect (cond ((and (keywordp spec) (not (eq spec :null))) spec)
+                      ((as-form-p spec) (as-keyword (third spec)))
+                      (t (default-alias spec position)))))
+
+(defun explain (&key (col t) from where distinct order-by inner-join limit offset
+                  group-by having left-join right-join full-join joins)
+  (with-snapshot
+    (let* ((tbl (find-table from))
+           (join-list (all-joins inner-join left-join right-join full-join joins))
+           (plan (and where (plan-allowed-p join-list) (plan-access tbl where)))
+           (steps '()))
+      (flet ((add-step (&rest step) (push (cons :step step) steps)))
+        ;; the first table
+        (if (and plan (eq (getf plan :kind) :index))
+            (add-step :scan :table (name tbl) :access :index :index (getf plan :index)
+                        :column (getf plan :column) :op (getf plan :op)
+                        :rows (length (getf plan :ids)))
+            (apply #'add-step :scan :table (name tbl) :access :full-scan :rows (fset:size (rows tbl))
+                          (cond ((null where) nil)
+                                ((not (plan-allowed-p join-list)) (list :reason :right-or-full-join))
+                                ((not (consp where)) (list :reason :function))
+                                (t (list :reason :no-index-condition)))))
+        ;; the joins
+        (loop for (kind . spec) in join-list
+              for first = t then nil
+              do (let* ((other (find-table (first spec)))
+                        (index (and (member kind '(:inner :left))
+                                    (table-index-for other (as-keyword (third spec)))))
+                        (rows-in (if plan
+                                     (length (plan-ids tbl plan))
+                                     (fset:size (rows tbl)))))
+                   (add-step :join :kind kind :table (name other) :on (list (second spec) (third spec))
+                               :method (cond ((null index) :hash)
+                                             ((not first) :index-or-hash)
+                                             ((< (* 4 rows-in) (fset:size (rows other))) :index)
+                                             (t :hash))
+                               :index (and index (index-name index)))))
+        (when where
+          (add-step :filter :where (if (consp where) where :function)))
+        (when (grouped-query-p col group-by having order-by)
+          (add-step :group :by (expression-list group-by) :having having))
+        (when order-by
+          (add-step :sort :keys (if (functionp order-by)
+                                :function
+                                (mapcar #'(lambda (key)
+                                            (destructuring-bind (direction expr nulls) key
+                                              (list :key expr :direction direction :nulls nulls)))
+                                        (order-keys order-by)))))
+        (unless (eql col t)
+          (add-step :project :columns (item-names col)))
+        (when distinct
+          (add-step :distinct))
+        (when (or limit offset)
+          (add-step :limit :limit limit :offset offset)))
+      (nreverse steps))))

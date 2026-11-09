@@ -20,7 +20,7 @@
     ;; indexes
     #:create-index #:drop-index #:show-indexes
     ;; queries
-    #:select #:matching
+    #:select #:matching #:explain
     ;; persistence
     #:save-db #:load-db #:open-db #:close-db #:checkpoint
     ;; conditions
