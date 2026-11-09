@@ -125,23 +125,119 @@ When you delete a row that other rows refer to, the `:on-delete` action of those
 
 ## Queries
 
-`select` returns a new table. Use `row-list` to get its rows.
+`select` returns a new table. Use `row-list` to get its rows. A query can be written with lambdas, with expressions (plain data), or with both.
 
 ```lisp
 (row-list (select :from "people"
-                  :where (matching "people" :age 30)
-                  :col '(:email :age)
-                  :order-by :age
-                  :distinct t))
-
-(row-list (select :from "pets"
-                  :inner-join '("people" :owner :id)
-                  :col '(:pet :email)))
+                  :where '(and (> :age 20) (like :email "%@x"))
+                  :col '(:email (as (+ :age 1) :next-age))
+                  :order-by '((desc :age) :email)
+                  :limit 10 :offset 20))
 ```
 
-- `:where` takes a function of one row. `matching` builds one from `:column value` pairs.
-- `matching` ignores a column when you give `nil` as its value.
-- A join fails if both tables have a column with the same name.
+| Keyword | Meaning |
+|---------|---------|
+| `:from` | table name or a table value |
+| `:col` | `t` (all), one item, or a list of items |
+| `:where` | function, function name or expression |
+| `:group-by`, `:having` | grouping, see below |
+| `:distinct` | drop duplicate result rows |
+| `:order-by` | sort keys, or a function of two rows |
+| `:limit`, `:offset` | cut the result, after sorting |
+| `:inner-join`, `:left-join`, `:right-join`, `:full-join`, `:joins` | other tables |
+
+### Lambdas
+
+`:where` takes a function of one row, or the name of one. `matching` builds one from `:column value` pairs. `:order-by` takes a function of two rows that is true when the first row sorts first. A function can also run inside an expression with `(fn f arg ...)`.
+
+```lisp
+(select :from "people" :where (lambda (row) (eql 30 (getf row :age))))
+(select :from "people" :where (matching "people" :age 30))
+(select :from "people" :where '(fn starts-with-a :name))
+```
+
+`matching` ignores a column when you give `nil` as its value. `:null` matches NULL.
+
+### Expressions
+
+An expression is data. A keyword is a column. `:null` is NULL. Numbers, strings, `t` and `nil` are constants. `(quote :red)` is a constant keyword.
+
+| Form | Meaning |
+|------|---------|
+| `(= a b)` `(/= a b)` `(< a b)` `(> a b)` `(<= a b)` `(>= a b)` | compare |
+| `(and ...)` `(or ...)` `(not a)` | logic |
+| `(in a b c ...)` `(between a lo hi)` | membership and range |
+| `(like a "pat%")` | `%` matches any run, `_` one character, `\` escapes |
+| `(is-null a)` `(is-not-null a)` `(coalesce a b ...)` | NULL tests |
+| `(+ a b ...)` `(- a b)` `(* a b ...)` `(/ a b)` | arithmetic |
+| `(lower a)` `(upper a)` `(length a)` `(concat a b ...)` | strings |
+| `(fn f a b ...)` | call your function with the values. It sees NULL as `:null` |
+
+Operators match by name, so `(like ...)` and `(:like ...)` both work.
+
+Truth has three values, as in SQL. Comparing with NULL gives unknown. `:where` keeps a row only when the result is true. So `(not (= :age 30))` does not keep a row with a NULL age. An unknown result that is stored or sorted becomes NULL. Arithmetic and string functions return NULL when an argument is NULL.
+
+A wrong column, operator or argument count is an error when the query starts, even for an empty table.
+
+### Items in `:col`
+
+An item is a column, `(as expression :alias)`, or an expression. An unnamed expression is called `:EXPR1`, `:EXPR2` by its place in the list. A list in `:col` is always a list of items, so one expression needs extra brackets: `:col '((+ :age 1))`. Aliases work in `:order-by` and `:having`, not in `:where`.
+
+### Sorting
+
+A key is a column, `(asc expr)` or `(desc expr)`, or any other expression, which sorts up. Add `:nulls :first` or `:nulls :last` to a key. NULL sorts last by default, in both directions. `:order-by` is one key or a list of keys. A list that starts with `asc` or `desc` is one key, so `(desc :age)` needs no extra brackets. For a column named `asc` or `desc`, write `((asc :desc))`. The sort is stable.
+
+### Grouping
+
+```lisp
+(select :from "sales"
+        :group-by :dept
+        :col '(:dept (count) (as (sum :amount) :total))
+        :having '(> (sum :amount) 100)
+        :order-by '((desc :total)))
+```
+
+Aggregates: `(count)`, `(count x)`, `(count-distinct x)`, `(sum x)`, `(avg x)`, `(min x)` and `(max x)`. They skip NULL. `sum`, `avg`, `min` and `max` of no values are NULL. `avg` is a double-float. An unnamed aggregate is called `:COUNT` or `:SUM-AMOUNT`.
+
+- A query is grouped when it has `:group-by` or `:having`, or an aggregate in `:col` or `:order-by`.
+- Without `:group-by`, all rows make one group, even when none pass `:where`.
+- NULL is a group of its own. Groups come out in the order their first row appeared.
+- A grouped query needs `:col`. `:col`, `:having` and `:order-by` can use a `:group-by` expression as written, an alias, and aggregates, even inside other expressions such as `(/ (sum :a) (count))`.
+- A column that is not grouped is a `query-error` outside an aggregate. So is an aggregate in `:where`.
+- `:group-by` is a column, an expression or a list. A list is always a list of expressions.
+
+### Joins
+
+A join is `(table here there)`. `here` is a column of the rows so far. `there` is a column of the joined table. Rows join where the two values are equal. NULL never matches.
+
+```lisp
+(select :from "people"
+        :left-join '("pets" :id :owner)
+        :group-by :name
+        :col '(:name (as (count :pet) :pets)))
+```
+
+- `:inner-join` drops rows without a match.
+- `:left-join` keeps unmatched rows of the first table, with NULL for the new columns.
+- `:right-join` keeps unmatched rows of the joined table, with NULL for the earlier columns, after the matches.
+- `:full-join` does both.
+- Each keyword takes one join or a list of joins. They apply in that order. `:joins` takes `(kind table here there)` entries, with kind `:inner`, `:left`, `:right` or `:full`, for another order.
+- Two tables cannot share a column name. Add `:as prefix` to a join. The columns of that table are then named `:PREFIX.COLUMN`. `there` still uses the plain name. This also lets a table join itself.
+
+### Changing many rows
+
+```lisp
+(update-where "people" '(:active nil) :where '(< :age 18))          ; => rows changed
+(update-where "people" nil :where t :compute '(:age (+ :age 1)))    ; age = age + 1
+(update-where "people" (lambda (row) (list :name (string-upcase (getf row :name))))
+              :where t)
+(delete-where "people" :where '(is-null :email))                     ; => rows deleted
+```
+
+- The changes are `:column value` pairs, or a function of the old row that returns them. `:compute` takes `:column expression` pairs, worked out on the old row.
+- Both run in one transaction. All rows change or none do.
+- `:where` is required. Use `:where t` for every row.
+- `delete-where` applies `:on-delete` rules to each row. Its count does not include rows that a cascade deleted.
 
 ## Errors
 
