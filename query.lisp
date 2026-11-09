@@ -18,8 +18,9 @@
   (with-snapshot
     (let* ((tbl (find-table from))
            (schema (schema tbl))
-           (rows (row-list tbl)))
-      (loop for (kind . spec) in (all-joins inner-join left-join right-join full-join joins)
+           (join-list (all-joins inner-join left-join right-join full-join joins))
+           (rows (base-rows tbl where join-list)))
+      (loop for (kind . spec) in join-list
             do (multiple-value-setq (rows schema) (join-rows rows schema kind spec)))
       (when where
         (setf rows (restrict-rows rows (compile-where where schema))))
@@ -32,6 +33,200 @@
       (when (or limit offset)
         (setf rows (slice-rows rows limit offset)))
       (make-result-table rows schema))))
+
+;;; Access plans
+;;;
+;;; A :where that is an expression can often be answered from an index. The planner
+;;; looks at the parts of an AND that compare one column of the table with
+;;; constants: = < > <= >= between and in. It picks the one that should find the
+;;; fewest rows and reads the matching ids from the index. The whole :where still
+;;; runs on those rows, so the plan can only make a query faster. The rows come out
+;;; in id order, as a scan gives them.
+;;;
+;;; A function in :where, an OR, a NOT, and any other shape make a scan. So does a
+;;; column without an index.
+
+(defun op-name-of (expr)
+  (and (consp expr) (symbolp (first expr)) (symbol-name (first expr))))
+
+;; True when EXPR names no column and calls no function of yours, so it has one
+;; value for the whole query.
+(defun constant-expr-p (expr)
+  (cond ((eq expr :null) t)
+        ((keywordp expr) nil)
+        ((or (null expr) (eq expr t)) t)
+        ((symbolp expr) nil)
+        ((atom expr) t)
+        (t (let ((name (op-name-of expr)))
+             (and name
+                  (not (string= name "FN"))
+                  (not (member name *aggregate-names* :test #'string=))
+                  (or (string= name "QUOTE")
+                      (every #'constant-expr-p (rest expr))))))))
+
+;; Return the value of a constant expression and t. If it can't be worked out, nil.
+(defun constant-value (expr)
+  (handler-case (values (materialize (funcall (compile-expr expr (make-ectx nil)) nil)) t)
+    (hash-db-error () (values nil nil))))
+
+(defun conjuncts (where)
+  (if (equal (op-name-of where) "AND")
+      (loop for part in (rest where) append (conjuncts part))
+      (list where)))
+
+(defun flip-comparison (name)
+  (cdr (assoc name '(("<" . ">") (">" . "<") ("<=" . ">=") (">=" . "<=") ("=" . "="))
+              :test #'string=)))
+
+;; Describe a comparison of one column with constants as (column kind . details), or
+;; return nil. Kinds: (:eq value), (:in values), (:range low low-inclusive high high-inclusive).
+(defun sargable (conjunct schema)
+  (let ((name (op-name-of conjunct))
+        (args (rest conjunct)))
+    (flet ((column-of (x)
+             (and (keywordp x) (not (eq x :null)) (find x schema :key #'name)))
+           (const (x)
+             (and (constant-expr-p x) (multiple-value-list (constant-value x)))))
+      (cond
+        ((and name (member name '("=" "<" ">" "<=" ">=") :test #'string=) (= 2 (length args)))
+         (destructuring-bind (a b) args
+           (let* ((flipped (column-of b))
+                  (column (or (column-of a) flipped))
+                  (op (if (column-of a) name (and flipped (flip-comparison name))))
+                  (value (and column (const (if (column-of a) b a)))))
+             (when (and column value (second value) op)
+               (let ((v (first value)))
+                 (list column
+                       (cond ((string= op "=") (list :eq v))
+                             ((string= op "<") (list :range nil nil v nil))
+                             ((string= op "<=") (list :range nil nil v t))
+                             ((string= op ">") (list :range v nil nil nil))
+                             (t (list :range v t nil nil)))))))))
+        ((and (equal name "BETWEEN") (= 3 (length args)) (column-of (first args)))
+         (let ((lo (const (second args))) (hi (const (third args))))
+           (when (and lo hi (second lo) (second hi))
+             (list (column-of (first args)) (list :range (first lo) t (first hi) t)))))
+        ((and (equal name "IN") (>= (length args) 2) (column-of (first args))
+              (every #'constant-expr-p (rest args)))
+         (let ((values (mapcar #'constant-value (rest args))))
+           (when (every #'(lambda (arg) (second (multiple-value-list (constant-value arg)))) (rest args))
+             (list (column-of (first args)) (list :in values)))))))))
+
+;; Cut two range limits down to the tighter one. A bound is (value inclusive).
+(defun tighter-bound (a b side)
+  (cond ((null (first a)) b)
+        ((null (first b)) a)
+        (t (let ((order (value-compare (first a) (first b))))
+             (cond ((eq order :eq) (list (first a) (and (second a) (second b))))
+                   ((eq side :low) (if (eq order :gt) a b))
+                   (t (if (eq order :lt) a b)))))))
+
+;; Join the :range parts on one column, so (and (> :a 1) (< :a 9)) is one range.
+(defun merge-sargs (sargs)
+  (let ((merged '()))
+    (dolist (sarg sargs (nreverse merged))
+      (destructuring-bind (column (kind . details) &aux (same (and (eq kind :range)
+                                                                  (find-if #'(lambda (m) (and (eq (first m) column)
+                                                                                              (eq (first (second m)) :range)))
+                                                                           merged))))
+          sarg
+        (if same
+            (destructuring-bind (low low-inclusive high high-inclusive) (rest (second same))
+              (let ((new-low (tighter-bound (list low low-inclusive) (list (first details) (second details)) :low))
+                    (new-high (tighter-bound (list high high-inclusive) (list (third details) (fourth details)) :high)))
+                (setf (second same) (list :range (first new-low) (second new-low)
+                                          (first new-high) (second new-high)))))
+            (push (list column (cons kind details)) merged))))))
+
+;; Lower is better.
+(defun sarg-score (tbl sarg)
+  (destructuring-bind (column (kind . details)) sarg
+    (let ((primary (typep column 'primary-key-column))
+          (index (table-index-for tbl (name column))))
+      (cond ((and primary (member kind '(:eq :in))) (if (eq kind :eq) 0 3))
+            (primary nil)
+            ((null index) nil)
+            ((eq kind :eq) (if (index-unique index) 1 2))
+            ((eq kind :in) 3)
+            ((not (range-column-p column)) nil)
+            ((and (first details) (third details)) 4)
+            (t 5)))))
+
+(defun key-kind-matches-p (column value)
+  (if (subtypep (value-type column) 'real) (realp value) (stringp value)))
+
+;; The ids a comparison selects, in any order, or :unusable when the index can't answer.
+(defun sarg-ids (tbl sarg)
+  (destructuring-bind (column (kind . details)) sarg
+    (let ((index (table-index-for tbl (name column)))
+          (primary (typep column 'primary-key-column)))
+      (flet ((lookup (value)
+               (cond ((null-value-p value) nil)
+                     (primary (let ((id (and (realp value) (integerp (rational value)) (rational value))))
+                                (and id (nth-value 1 (fset:lookup (rows tbl) id)) (list id))))
+                     (t (index-ids index value)))))
+        (ecase kind
+          (:eq (lookup (first details)))
+          (:in (loop for value in (first details) append (lookup value)))
+          (:range
+           (destructuring-bind (low low-inclusive high high-inclusive) details
+             (cond ((or (and low (null-value-p low)) (and high (null-value-p high))) nil)
+                   ((and (or (null low) (key-kind-matches-p column low))
+                         (or (null high) (key-kind-matches-p column high)))
+                    (index-range-ids index low low-inclusive high high-inclusive))
+                   (t :unusable)))))))))
+
+;; Choose how to read the rows of TBL for WHERE. Return a list:
+;;   (:kind :scan)
+;;   (:kind :index :index name :column c :op :eq/:in/:range :ids ids)
+;; An :index plan reads the primary key too, with :index :primary-key.
+(defun plan-access (tbl where)
+  (let ((scan (list :kind :scan)))
+    (if (or (null where) (functionp where) (not (consp where)))
+        scan
+        (let ((candidates (loop for sarg in (merge-sargs (loop for part in (conjuncts where)
+                                                                when (consp part)
+                                                                  append (let ((s (sargable part (schema tbl))))
+                                                                           (and s (list s)))))
+                                for score = (sarg-score tbl sarg)
+                                when score collect (cons score sarg))))
+          (loop for (nil . sarg) in (stable-sort candidates #'< :key #'car)
+                for ids = (sarg-ids tbl sarg)
+                unless (eq ids :unusable)
+                  do (return (list :kind :index
+                                   :index (if (typep (first sarg) 'primary-key-column)
+                                              :primary-key
+                                              (index-name (table-index-for tbl (name (first sarg)))))
+                                   :column (name (first sarg))
+                                   :op (first (second sarg))
+                                   :ids (sort (remove-duplicates ids) #'<)))
+                finally (return scan))))))
+
+(defun all-row-ids (tbl)
+  (let ((ids '()))
+    (fset:do-map (id row (rows tbl))
+      (declare (ignorable row))
+      (push id ids))
+    (nreverse ids)))
+
+;; The ids a plan reads, in id order.
+(defun plan-ids (tbl plan)
+  (if (eq (getf plan :kind) :scan)
+      (all-row-ids tbl)
+      (getf plan :ids)))
+
+;; Right and full joins keep rows of the first table that have no match, so the
+;; first table must not be cut down before the join.
+(defun plan-allowed-p (joins)
+  (notany #'(lambda (join) (member (car join) '(:right :full))) joins))
+
+(defun base-rows (tbl where joins)
+  (if (and where (plan-allowed-p joins))
+      (let ((plan (plan-access tbl where)))
+        (if (eq (getf plan :kind) :scan)
+            (row-list tbl)
+            (mapcar #'(lambda (id) (fset:lookup (rows tbl) id)) (getf plan :ids))))
+      (row-list tbl)))
 
 ;; Sort and project rows. Return the new rows and the schema of the result.
 (defun select-rows (rows schema col order-by)
@@ -419,12 +614,10 @@
            :message (format nil "~A needs :where. Use :where t to change every row." who))))
 
 ;; The ids of the rows of TBL that pass PREDICATE, in id order.
-(defun matching-row-ids (tbl predicate)
-  (let ((ids '()))
-    (fset:do-map (id row (rows tbl))
-      (when (funcall predicate row)
-        (push id ids)))
-    (nreverse ids)))
+(defun matching-row-ids (tbl where predicate)
+  (loop for id in (plan-ids tbl (plan-access tbl where))
+        when (funcall predicate (fset:lookup (rows tbl) id))
+          collect id))
 
 ;; Change the rows that pass WHERE.
 ;; CHANGES is a list of :column value pairs, or a function of the old row that
@@ -445,7 +638,7 @@
                  (intersection (mapcar #'first computed)
                                (loop for key in changes by #'cddr collect (as-keyword key))))
         (error 'query-error :message "A column is in both the changes and :compute"))
-      (let ((ids (matching-row-ids tbl predicate)))
+      (let ((ids (matching-row-ids tbl where predicate)))
         (dolist (id ids)
           (let ((row (fset:lookup (rows tbl) id)))
             (update-row id
@@ -461,6 +654,6 @@
   (require-where where "delete-where")
   (with-transaction
     (let* ((tbl (stored-table table))
-           (ids (matching-row-ids tbl (compile-where where (schema tbl)))))
+           (ids (matching-row-ids tbl where (compile-where where (schema tbl)))))
       (count-if #'identity
                 (mapcar #'(lambda (id) (delete-row id table)) ids)))))
