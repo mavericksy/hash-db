@@ -59,7 +59,8 @@
 ;; the journal: what the transaction changed, newest entry first.
 ;; Entries are plain data: (:create-table name specs), (:drop-table name),
 ;; (:insert table id row), (:update table id row), (:delete table id) and
-;; (:add-column table spec id-rows). REPLAY-ENTRIES applies them to a root.
+;; (:add-column table spec id-rows), (:create-index table name column unique)
+;; and (:drop-index table name). REPLAY-ENTRIES applies them to a root.
 (defstruct (txn (:constructor make-txn (root)))
   root
   (journal nil))
@@ -633,6 +634,63 @@
         tbl
         (updated-table tbl :indexes indexes))))
 
+;;; Making and dropping indexes. A table has the implicit indexes of its schema, and
+;;; the indexes that were made here. Only these are saved and logged.
+
+(defun index-named (tbl name)
+  (find name (indexes tbl) :key #'index-name))
+
+;; Make an index on COLUMN of TABLE and return its name. The default name is
+;; :COLUMN-INDEX. With :unique t, two rows may not hold the same non-null value,
+;; and the call fails if they already do.
+(defun create-index (table column &key name unique)
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (col (find-column column (schema tbl)))
+           (unique (and unique t))
+           (name (as-keyword (or name (format nil "~A-INDEX" (name col))))))
+      (when (typep col 'primary-key-column)
+        (error 'schema-error
+               :message (format nil "Column ~A is the primary key. Rows are stored by it already."
+                                (name col))))
+      (when (index-named tbl name)
+        (error 'schema-error
+               :message (format nil "Table ~A already has an index named ~A" (name tbl) name)))
+      (let ((twin (find-if #'(lambda (ix) (and (eq (index-column ix) (name col))
+                                               (eq (and (index-unique ix) t) unique)))
+                           (indexes tbl))))
+        (when twin
+          (error 'schema-error
+                 :message (format nil "Column ~A of table ~A already has the ~:[~;unique ~]index ~A"
+                                  (name col) (name tbl) unique (index-name twin)))))
+      (let ((index (build-index tbl name (name col) unique t)))
+        (put-table (updated-table tbl :indexes (append (indexes tbl) (list index))))
+        (journal-add (list :create-index (name tbl) name (name col) unique))
+        name))))
+
+;; Drop an index that CREATE-INDEX made. Return t, or nil if there is no such index.
+;; An index that comes from the schema can't be dropped.
+(defun drop-index (name table)
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (name (as-keyword name))
+           (index (index-named tbl name)))
+      (when index
+        (unless (index-explicit index)
+          (error 'schema-error
+                 :message (format nil "Index ~A comes from the schema of table ~A. Change the column to drop it."
+                                  name (name tbl))))
+        (put-table (updated-table tbl :indexes (remove index (indexes tbl))))
+        (journal-add (list :drop-index (name tbl) name))
+        t))))
+
+;; The indexes of a table as a list of (:name n :column c :unique u :explicit e).
+(defun show-indexes (table)
+  (mapcar #'(lambda (ix)
+              (list :name (index-name ix) :column (index-column ix)
+                    :unique (and (index-unique ix) t) :explicit (and (index-explicit ix) t)))
+          (indexes (find-table table))))
+
 ;; The table with row ID set to ROW, with its indexes kept in step. Use this and
 ;; TABLE-WITHOUT-ROW for every change to the rows of a table.
 (defun table-with-row (tbl id row &key (pk (pk tbl)))
@@ -851,20 +909,33 @@
 ;;; Persistence. A file holds plain data: table names, row ids, rows and
 ;;; column specs. Locks and functions are rebuilt on load.
 
-(defparameter +file-format-version+ 3)
+(defparameter +file-format-version+ 4)
+
+;; Files of these versions can be read. Version 4 added the indexes that
+;; CREATE-INDEX made. A version 3 file has none.
+(defparameter +readable-file-versions+ '(3 4))
 
 (defun table-snapshot (tbl)
   (list (name tbl)
         (pk tbl)
         (mapcar #'spec (schema tbl))
-        (fset:convert 'list (rows tbl))))
+        (fset:convert 'list (rows tbl))
+        ;; only the indexes that CREATE-INDEX made. The others come from the schema.
+        (loop for ix in (indexes tbl)
+              when (index-explicit ix)
+                collect (list (index-name ix) (index-column ix) (and (index-unique ix) t)))))
 
 (defun restore-table (snapshot)
-  (destructuring-bind (name pk col-specs id-rows) snapshot
-    (ensure-implicit-indexes
-     (make-instance 'table :name name :pk pk
-                           :schema (make-schema col-specs)
-                           :rows (fset:convert 'fset:map id-rows)))))
+  (destructuring-bind (name pk col-specs id-rows &optional index-specs) snapshot
+    (let ((tbl (ensure-implicit-indexes
+                (make-instance 'table :name name :pk pk
+                                      :schema (make-schema col-specs)
+                                      :rows (fset:convert 'fset:map id-rows)))))
+      (dolist (spec index-specs tbl)
+        (destructuring-bind (index-name column unique) spec
+          (setf tbl (updated-table tbl :indexes (append (indexes tbl)
+                                                        (list (build-index tbl index-name column
+                                                                           unique t))))))))))
 
 ;; A file holds data only. A function option in a column spec (:check or
 ;; :default-fn) is saved if it is a function name, but not if it is a function object.
@@ -916,6 +987,18 @@
        (destructuring-bind (name id) (rest entry)
          (let ((tbl (table-named name)))
            (fset:with root name (table-without-row tbl id)))))
+      (:create-index
+       (destructuring-bind (name index-name column unique) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name
+                      (updated-table tbl :indexes (append (indexes tbl)
+                                                          (list (build-index tbl index-name column unique t))))))))
+      (:drop-index
+       (destructuring-bind (name index-name) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name
+                      (updated-table tbl :indexes (remove index-name (indexes tbl)
+                                                          :key #'index-name))))))
       (:add-column
        (destructuring-bind (name spec id-rows) (rest entry)
          (let ((tbl (table-named name)))
@@ -995,7 +1078,7 @@
                   ((or cl-store:restore-error end-of-file) (c) (bad (princ-to-string c))))))
       (unless (and (consp data)
                    (eq (first data) :hash-db)
-                   (eql (second data) +file-format-version+)
+                   (member (second data) +readable-file-versions+)
                    (integerp (third data))
                    (listp (fourth data)))
         (bad nil))

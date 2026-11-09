@@ -17,6 +17,8 @@
     #:with-transaction #:rollback #:with-snapshot
     ;; rows
     #:insert-row #:get-row #:update-row #:delete-row #:row-list #:update-where #:delete-where
+    ;; indexes
+    #:create-index #:drop-index #:show-indexes
     ;; queries
     #:select #:matching
     ;; persistence
