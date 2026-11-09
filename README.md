@@ -239,6 +239,57 @@ A join is `(table here there)`. `here` is a column of the rows so far. `there` i
 - `:where` is required. Use `:where t` for every row.
 - `delete-where` applies `:on-delete` rules to each row. Its count does not include rows that a cascade deleted.
 
+## Indexes
+
+An index finds rows by the value of one column without a scan.
+
+```lisp
+(create-index "people" :age)                     ; => :AGE-INDEX
+(create-index "people" :email :unique t :name :email-key)
+(show-indexes "people")
+(drop-index :age-index "people")                 ; => t, or nil if there is none
+```
+
+- A `:unique` column and a `foreign-key-column` get an index by themselves. It is part of the schema. You cannot drop it. The primary key needs none, because rows are stored by id.
+- `create-index` takes one column. `:unique t` also enforces uniqueness, and it fails without changing anything if the rows already hold a duplicate. NULL is not indexed, so NULL values never clash.
+- `create-index` and `drop-index` are transactions. The log and the snapshot keep the indexes that `create-index` made. An older version 3 file loads without them.
+- Indexes belong to the same immutable snapshot as the rows. A reader never sees an index that does not match its rows.
+- The checks for `:unique` and the search for child rows in a cascade use these indexes, so they do not scan the table.
+
+### What a query uses
+
+`select`, `update-where` and `delete-where` read through an index when the `:where` is an expression. The planner looks at the parts of an `and` that compare one column of the first table with constants:
+
+`(= :c v)` `(< :c v)` `(> :c v)` `(<= :c v)` `(>= :c v)` `(between :c lo hi)` `(in :c v ...)`
+
+- A constant can be an expression without columns, such as `(+ 5 5)`. A constant on the left works too: `(< 10 :c)`.
+- Two limits on one column make one range: `(and (> :c 1) (< :c 9))`.
+- The planner picks the condition that should find the fewest rows. The primary key is best, then a unique index, an equality, an `in`, and then a range.
+- The whole `:where` still runs on the rows it finds. A plan can change the speed. It never changes the result, and rows still come out in id order.
+- A range works on columns of numbers or of strings. Strings compare by character code.
+- These make a scan: a function in `:where`, `or`, `not`, a column without an index, a range on another type of column, and a condition on a column of a joined table. A right or full join reads the whole first table.
+
+### Joins
+
+A join uses an index on the joined column when the join is inner or left and fewer than a quarter as many rows look as the joined table holds. Otherwise it builds one hash table for the query. The rows come out in the same order as before.
+
+### Explain
+
+`explain` takes the arguments of `select` and returns the steps without running the query.
+
+```lisp
+(explain :from "people" :where '(and (= :city "oslo") (> :age 20)) :order-by :age :limit 5)
+;; => ((:STEP :SCAN :TABLE "people" :ACCESS :INDEX :INDEX :CITY-INDEX :COLUMN :CITY
+;;            :OP :EQ :ROWS 12)
+;;     (:STEP :FILTER :WHERE (AND (= :CITY "oslo") (> :AGE 20)))
+;;     (:STEP :SORT :KEYS ((:KEY :AGE :DIRECTION :ASC :NULLS :LAST)))
+;;     (:STEP :LIMIT :LIMIT 5 :OFFSET NIL))
+```
+
+The scan step reads the index it would use, so its row count is exact. When there is no index step, it says why with `:reason`: `:function`, `:right-or-full-join` or `:no-index-condition`. A join step shows `:method` as `:index`, `:hash` or `:index-or-hash`.
+
+`scripts/bench.lisp` times queries with and without an index on your machine.
+
 ## Errors
 
 Every error that hash-db signals is a `hash-db-error`.
