@@ -51,10 +51,29 @@
 
 (defvar *txn* nil)
 
+;; The fixed root of an open WITH-SNAPSHOT in this thread.
+(defvar *snapshot* nil)
+
 ;; The root this thread reads: its own working root inside a transaction,
-;; else the last committed root.
+;; else the fixed root of a snapshot, else the last committed root.
 (defun current-root ()
-  (if *txn* (txn-root *txn*) (db-root *db*)))
+  (cond (*txn* (txn-root *txn*))
+        (*snapshot*)
+        (t (db-root *db*))))
+
+(defun call-with-snapshot (fn)
+  (if (or *txn* *snapshot*)
+      (funcall fn)
+      (let ((*snapshot* (db-root *db*)))
+        (funcall fn))))
+
+;; Run BODY against one fixed, committed state of the database. Every read in
+;; BODY sees the same data, even if other threads commit meanwhile. Changes
+;; made in BODY commit as usual, but BODY does not see them.
+;; Inside a transaction this does nothing, because a transaction already
+;; reads its own working state.
+(defmacro with-snapshot (&body body)
+  `(call-with-snapshot (lambda () ,@body)))
 
 ;; Run FN as one atomic change. The new root becomes visible only when FN returns.
 ;; If FN exits any other way, the change is dropped.
@@ -613,21 +632,22 @@
 ;; INNER-JOIN is (table-name column-here column-there).
 ;; Return a new table. Its rows are keyed 1..n in result order.
 (defun select (&key (col t) from where distinct order-by inner-join)
-  (let* ((tbl (find-table from))
-         (schema (schema tbl))
-         (rows (row-list tbl)))
-    (when inner-join
-      (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
-    (when where
-      (setf rows (restrict-rows rows where)))
-    (when order-by
-      (setf rows (sorted-rows rows schema (mklist order-by))))
-    (unless (eql col t)
-      (setf schema (extract-schema (mklist col) schema))
-      (setf rows (project-columns rows schema)))
-    (when distinct
-      (setf rows (distinct-rows rows schema)))
-    (make-result-table rows schema)))
+  (with-snapshot
+    (let* ((tbl (find-table from))
+           (schema (schema tbl))
+           (rows (row-list tbl)))
+      (when inner-join
+        (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
+      (when where
+        (setf rows (restrict-rows rows where)))
+      (when order-by
+        (setf rows (sorted-rows rows schema (mklist order-by))))
+      (unless (eql col t)
+        (setf schema (extract-schema (mklist col) schema))
+        (setf rows (project-columns rows schema)))
+      (when distinct
+        (setf rows (distinct-rows rows schema)))
+      (make-result-table rows schema))))
 
 (defun make-result-table (rows schema)
   (make-instance 'table

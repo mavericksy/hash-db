@@ -689,6 +689,53 @@
     (mapc #'bt:join-thread threads))
   (is (= 200 (getf (get-row 1 "c") :n))))
 
+;;; snapshots
+
+(def-test snapshot-reads-one-fixed-state (:fixture clean-db)
+  (make-people)
+  (add-people)
+  (with-snapshot
+    (insert-row '(:name "dan") "people")
+    (delete-row 1 "people")
+    (is (= 3 (count-rows "people")) "the snapshot does not see changes made after it started")
+    (is (equal '("ann" "bob" "cat") (names-of (select :from "people")))))
+  (is (= 3 (count-rows "people")))
+  (is (equal '("bob" "cat" "dan") (names-of "people"))))
+
+(def-test snapshot-ignores-commits-of-other-threads (:fixture clean-db)
+  (make-people)
+  (add-people)
+  (with-snapshot
+    (bt:join-thread (bt:make-thread (lambda () (insert-row '(:name "dan") "people"))))
+    (is (= 3 (count-rows "people")))
+    (is (= 3 (length (row-list (select :from "people"))))))
+  (is (= 4 (count-rows "people"))))
+
+(def-test snapshot-covers-all-tables-of-a-join (:fixture clean-db)
+  (make-people)
+  (make-table "pets" '((:pet-id primary-key-column)
+                       (:owner foreign-key-column :references "people")
+                       (:pet string)))
+  (add-people)
+  (insert-row '(:owner 1 :pet "rex") "pets")
+  (with-snapshot
+    (insert-row '(:owner 2 :pet "tom") "pets")
+    (is (= 1 (count-rows (select :from "pets" :inner-join '("people" :owner :id)))))))
+
+(def-test snapshot-inside-a-transaction-reads-the-working-state (:fixture clean-db)
+  (make-people)
+  (with-transaction
+    (insert-row '(:name "a") "people")
+    (with-snapshot
+      (is (= 1 (count-rows "people"))))))
+
+(def-test select-keeps-a-table-stable-after-it-returns (:fixture clean-db)
+  (make-people)
+  (add-people)
+  (let ((result (select :from "people" :order-by :age)))
+    (update-row 1 '(:age 99) "people")
+    (is (equal '(25 30 30) (mapcar (lambda (r) (getf r :age)) (row-list result))))))
+
 ;;; select
 
 (def-test select-all-rows (:fixture clean-db)

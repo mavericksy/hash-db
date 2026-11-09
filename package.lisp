@@ -14,7 +14,7 @@
     #:primary-key-column #:foreign-key-column #:interned-string
     #:timestamp #:any
     ;; transactions
-    #:with-transaction #:rollback
+    #:with-transaction #:rollback #:with-snapshot
     ;; rows
     #:insert-row #:get-row #:update-row #:delete-row #:row-list
     ;; queries
