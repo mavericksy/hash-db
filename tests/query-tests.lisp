@@ -165,3 +165,98 @@
                                                 :where '(> :age 26))))))
   (let ((old (select :from "people" :where '(>= :age 30))))
     (is (equal '("ann") (names-of (select :from old :where '(like :name "a%")))))))
+
+;;; limit and offset
+
+(defun ids-of (table) (mapcar (lambda (r) (getf r :id)) (row-list table)))
+
+(def-test limit-and-offset (:fixture clean-db)
+  (make-sample-people)
+  (flet ((ids (&rest args) (ids-of (apply #'select :from "people" :order-by :id args))))
+    (is (equal '(1 2) (ids :limit 2)))
+    (is (equal '(3 4 5) (ids :offset 2)))
+    (is (equal '(2 3) (ids :limit 2 :offset 1)))
+    (is (equal '(5) (ids :limit 10 :offset 4)))
+    (is (equal '() (ids :limit 0)))
+    (is (equal '() (ids :offset 99)))
+    (is (equal '(1 2 3 4 5) (ids :limit 99)))))
+
+(def-test limit-applies-after-where-sort-and-distinct (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '(5 1) (ids-of (select :from "people" :where '(is-not-null :age)
+                                    :order-by '((desc :age) :id) :limit 2))))
+  (is (equal '((:age 25) (:age 30))
+             (row-list (select :from "people" :col :age :distinct t :order-by :age :limit 2)))))
+
+(def-test bad-limit-and-offset (:fixture clean-db)
+  (make-people)
+  (signals query-error (select :from "people" :limit -1))
+  (signals query-error (select :from "people" :limit 1.5))
+  (signals query-error (select :from "people" :offset "2")))
+
+;;; ordering
+
+(defun order-names (order-by)
+  (names-of (select :from "people" :order-by order-by)))
+
+(def-test descending-order (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("Eve" "ann" "cat" "bob" "dan") (order-names '((desc :age) :id))))
+  (is (equal '("Eve" "ann" "cat" "bob" "dan") (order-names '((desc :age) :id))))
+  (is (equal '("Eve" "ann" "cat" "bob" "dan") (order-names '((:desc :age) :id))))
+  (is (equal '("dan" "cat" "bob" "ann" "Eve") (order-names '(desc :name)))
+      "strings sort by character code, so the capital E comes last when reversed"))
+
+(def-test nulls-go-last-unless-told-otherwise (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("bob" "ann" "cat" "Eve" "dan") (order-names '(:age :id))))
+  (is (equal "dan" (car (last (order-names '((desc :age) :id))))) "last in descending too")
+  (is (equal "dan" (first (order-names '((asc :age :nulls :first) :id)))))
+  (is (equal "dan" (first (order-names '((desc :age :nulls :first) :id))))))
+
+(def-test several-keys-with-mixed-directions (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("Eve" "ann" "cat" "bob" "dan")
+             (order-names '((asc (- 0 :age) :nulls :last) :id)))
+      "an expression key")
+  (is (equal '("Eve" "cat" "bob" "ann" "dan") (order-names '((asc (is-null :age)) (desc :id))))
+      "keys can be booleans too: false before true"))
+
+(def-test expression-keys (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("Eve" "ann" "cat" "bob" "dan")
+             (order-names '((desc (+ :age 0)) :id))))
+  (is (equal '("ann" "bob" "cat" "dan" "Eve")
+             (order-names '((lower :name))))))
+
+(def-test sort-is-stable (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("ann" "cat") (subseq (order-names '((desc :age) :active)) 1 3))
+      "ann and cat tie on both keys, so they keep their id order"))
+
+(def-test order-by-a-lambda (:fixture clean-db)
+  (make-sample-people)
+  (is (equal '("Eve" "dan" "cat" "bob" "ann")
+             (names-of (select :from "people"
+                               :order-by (lambda (a b) (> (getf a :id) (getf b :id))))))))
+
+(def-test column-named-desc-needs-a-wrapper (:fixture clean-db)
+  (make-table "t" '((:id primary-key-column) (:desc string)))
+  (insert-row '(:desc "b") "t")
+  (insert-row '(:desc "a") "t")
+  (is (equal '("a" "b") (mapcar (lambda (r) (getf r :desc))
+                                (row-list (select :from "t" :order-by '((asc :desc))))))))
+
+(def-test bad-order-keys (:fixture clean-db)
+  (make-sample-people)
+  (signals no-such-column (select :from "people" :order-by :nope))
+  (signals no-such-column (select :from "people" :order-by '(desc :nope)))
+  (signals query-error (select :from "people" :order-by '(asc :age :nulls :middle)))
+  (signals query-error (select :from "people" :order-by '((frobnicate :age)))))
+
+(def-test any-column-sorts-through-expressions (:fixture clean-db)
+  (make-table "t" '((:x any)))
+  (insert-row '(:x 3) "t")
+  (insert-row '(:x 1) "t")
+  (is (equal '(1 3) (mapcar (lambda (r) (getf r :x))
+                            (row-list (select :from "t" :order-by :x))))))

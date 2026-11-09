@@ -6,8 +6,11 @@
 ;; WHERE is a function of one row (see MATCHING), the name of one, or an
 ;; expression (see expr.lisp).
 ;; INNER-JOIN is (table-name column-here column-there).
+;; ORDER-BY is a column, an expression key, a list of keys, or a function of
+;; two rows that is true when the first row sorts first. See COMPILE-ORDER-KEY.
+;; LIMIT and OFFSET cut the result after sorting.
 ;; Return a new table. Its rows are keyed 1..n in result order.
-(defun select (&key (col t) from where distinct order-by inner-join)
+(defun select (&key (col t) from where distinct order-by inner-join limit offset)
   (with-snapshot
     (let* ((tbl (find-table from))
            (schema (schema tbl))
@@ -17,12 +20,14 @@
       (when where
         (setf rows (restrict-rows rows (compile-where where schema))))
       (when order-by
-        (setf rows (sorted-rows rows schema (mklist order-by))))
+        (setf rows (sorted-rows rows schema order-by)))
       (unless (eql col t)
         (setf schema (extract-schema (mklist col) schema))
         (setf rows (project-columns rows schema)))
       (when distinct
         (setf rows (distinct-rows rows schema)))
+      (when (or limit offset)
+        (setf rows (slice-rows rows limit offset)))
       (make-result-table rows schema))))
 
 (defun make-result-table (rows schema)
@@ -50,8 +55,14 @@
 (defun distinct-rows (rows schema)
   (remove-duplicates rows :test (row-equality-tester schema) :from-end t))
 
-(defun sorted-rows (rows schema order-by)
-  (stable-sort (copy-list rows) (row-comparator order-by schema)))
+(defun slice-rows (rows limit offset)
+  (dolist (n (list limit offset))
+    (unless (typep n '(or null (integer 0)))
+      (error 'query-error
+             :message (format nil "LIMIT and OFFSET must be whole numbers, 0 or more, got ~S" n))))
+  (let* ((start (min (or offset 0) (length rows)))
+         (end (if limit (min (+ start limit) (length rows)) (length rows))))
+    (subseq rows start end)))
 
 (defun join-rows (rows schema inner-join)
   (destructuring-bind (other-name here there) inner-join
@@ -90,26 +101,72 @@
                               ((or (null-value-p x) (null-value-p y)) nil)
                               (t (funcall test x y)))))))))
 
-;; True when row A sorts before row B. The first column that differs decides.
-;; NULL sorts after every other value.
-(defun row-comparator (col-names schema)
-  (let* ((names (mapcar #'as-keyword col-names))
-         (comparators (mapcar #'(lambda (col)
-                                  (or (comparator col)
-                                      (error 'query-error
-                                             :message (format nil "Column ~A has no comparator" (name col)))))
-                              (extract-schema names schema))))
-    #'(lambda (a b)
-        (loop for name in names
-              for comp in comparators
-              do (let ((a-v (getf a name))
-                       (b-v (getf b name)))
-                   (cond ((and (null-value-p a-v) (null-value-p b-v)))
-                         ((null-value-p a-v) (return nil))
-                         ((null-value-p b-v) (return t))
-                         ((funcall comp a-v b-v) (return t))
-                         ((funcall comp b-v a-v) (return nil))))
-              finally (return nil)))))
+;;; Sorting
+;;;
+;;; A key is a column, or (asc expr) or (desc expr), with the option
+;;; :nulls :first or :nulls :last. Any other list is an expression key that
+;;; sorts ascending. NULL sorts last unless the key says :nulls :first.
+;;; ORDER-BY is one key or a list of keys. A list that starts with asc or desc is
+;;; one key, so (desc :age) works without extra brackets. A column named ASC
+;;; or DESC goes in a wrapper: ((asc :desc)).
+
+(defun direction-form-p (x)
+  (and (consp x)
+       (symbolp (first x))
+       (member (symbol-name (first x)) '("ASC" "DESC") :test #'string=)
+       t))
+
+;; Return (direction expression nulls).
+(defun parse-order-key (item)
+  (if (direction-form-p item)
+      (destructuring-bind (direction expr &rest options) item
+        (let ((nulls (getf options :nulls :last)))
+          (unless (member nulls '(:first :last))
+            (error 'query-error :message (format nil ":nulls must be :first or :last, got ~S" nulls)))
+          (list (if (string= (symbol-name direction) "DESC") :desc :asc) expr nulls)))
+      (list :asc item :last)))
+
+(defun order-keys (order-by)
+  (cond ((null order-by) nil)
+        ((direction-form-p order-by) (list (parse-order-key order-by)))
+        ((listp order-by) (mapcar #'parse-order-key order-by))
+        (t (list (parse-order-key order-by)))))
+
+;; Return (value-function less direction nulls). A column sorts by its own
+;; comparator. Any other expression sorts with VALUE-LESS.
+(defun compile-order-key (key schema)
+  (destructuring-bind (direction expr nulls) key
+    (let* ((column (and (keywordp expr) (not (eq expr :null)) (find-column expr schema)))
+           (value-fn (compile-expr expr (make-ectx schema))))
+      (list value-fn (or (and column (comparator column)) #'value-less) direction nulls))))
+
+;; :lt, :eq or :gt for two lists of key values
+(defun compare-key-values (a-values b-values keys)
+  (loop for a in a-values
+        for b in b-values
+        for (nil less direction nulls) in keys
+        do (let ((order (cond ((and (null-value-p a) (null-value-p b)) :eq)
+                              ((null-value-p a) (if (eq nulls :first) :lt :gt))
+                              ((null-value-p b) (if (eq nulls :first) :gt :lt))
+                              ((funcall less a b) (if (eq direction :asc) :lt :gt))
+                              ((funcall less b a) (if (eq direction :asc) :gt :lt))
+                              (t :eq))))
+             (unless (eq order :eq)
+               (return order)))
+        finally (return :eq)))
+
+(defun sorted-rows (rows schema order-by)
+  (if (functionp order-by)
+      (stable-sort (copy-list rows) order-by)
+      (let* ((keys (mapcar #'(lambda (key) (compile-order-key key schema)) (order-keys order-by)))
+             (decorated (mapcar #'(lambda (row)
+                                    (cons (mapcar #'(lambda (key) (funcall (first key) row)) keys)
+                                          row))
+                                rows)))
+        (mapcar #'cdr
+                (stable-sort decorated
+                             #'(lambda (a b)
+                                 (eq :lt (compare-key-values (car a) (car b) keys))))))))
 
 (defun column-matcher (col val)
   (let ((name (name col))
