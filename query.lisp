@@ -406,3 +406,61 @@
 (defun matching (table &rest names-and-values)
   (let ((matchers (column-matchers (schema (find-table table)) names-and-values)))
     #'(lambda (row) (every #'(lambda (matcher) (funcall matcher row)) matchers))))
+
+;;; Changing many rows
+;;;
+;;; update-where and delete-where run in one transaction, so all the rows change or
+;;; none do. They need :where, as a function, a function name or an expression.
+;;; Use :where t to change every row. They return the number of rows changed.
+
+(defun require-where (where who)
+  (when (null where)
+    (error 'query-error
+           :message (format nil "~A needs :where. Use :where t to change every row." who))))
+
+;; The ids of the rows of TBL that pass PREDICATE, in id order.
+(defun matching-row-ids (tbl predicate)
+  (let ((ids '()))
+    (fset:do-map (id row (rows tbl))
+      (when (funcall predicate row)
+        (push id ids)))
+    (nreverse ids)))
+
+;; Change the rows that pass WHERE.
+;; CHANGES is a list of :column value pairs, or a function of the old row that
+;; returns such a list.
+;; COMPUTE is a list of :column expression pairs. Each expression is worked out on the
+;; old row, so (:age (+ :age 1)) adds one to age.
+(defun update-where (table changes &key where compute)
+  (require-where where "update-where")
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (schema (schema tbl))
+           (predicate (compile-where where schema))
+           (ctx (make-ectx schema))
+           (computed (loop for (column expr) on compute by #'cddr
+                           collect (list (name (find-column column schema))
+                                         (compile-value expr ctx)))))
+      (when (and (listp changes)
+                 (intersection (mapcar #'first computed)
+                               (loop for key in changes by #'cddr collect (as-keyword key))))
+        (error 'query-error :message "A column is in both the changes and :compute"))
+      (let ((ids (matching-row-ids tbl predicate)))
+        (dolist (id ids)
+          (let ((row (fset:lookup (rows tbl) id)))
+            (update-row id
+                        (append (if (functionp changes) (funcall changes row) changes)
+                                (loop for (name fn) in computed
+                                      append (list name (funcall fn row))))
+                        table)))
+        (length ids)))))
+
+;; Delete the rows that pass WHERE. Cascades and restrictions apply to each row.
+;; The count is the rows deleted, not the rows deleted by cascades.
+(defun delete-where (table &key where)
+  (require-where where "delete-where")
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (ids (matching-row-ids tbl (compile-where where (schema tbl)))))
+      (count-if #'identity
+                (mapcar #'(lambda (id) (delete-row id table)) ids)))))
