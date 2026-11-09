@@ -885,6 +885,42 @@
   (is (= 1 (count-rows (select :from "tags" :where (matching "tags" :tag (copy-seq "red"))))))
   (signals unique-violation (insert-row (list :tag (copy-seq "red")) "tags")))
 
+(def-test save-refuses-a-row-that-cannot-be-restored (:fixture clean-db)
+  (make-table "t" '((:x any)))
+  (insert-row '(:x "fine") "t")
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (insert-row (list :x (list 1 (lambda () 1))) "t")
+      (signals persistence-error (save-db path))
+      (clear-db)
+      (load-db path)
+      (is (equal '((:x "fine")) (row-list "t"))))))
+
+(def-test failed-write-leaves-the-old-file-and-no-temp-file (:fixture clean-db)
+  (call-with-temp-file
+    (lambda (path)
+      (with-open-file (out path :direction :output) (write-string "old" out))
+      (signals error
+        (hash-db::call-with-atomic-file
+         path
+         (lambda (tmp)
+           (with-open-file (out tmp :direction :output) (write-string "partial" out))
+           (error "disk full"))))
+      (is (equal "old" (with-open-file (in path) (read-line in))))
+      (is (null (probe-file (concatenate 'string (namestring path) ".tmp")))))))
+
+(def-test save-overwrites-an-existing-file (:fixture clean-db)
+  (make-people)
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (add-people)
+      (save-db path)
+      (clear-db)
+      (load-db path)
+      (is (= 3 (count-rows "people"))))))
+
 (def-test load-replaces-existing-tables (:fixture clean-db)
   (make-people)
   (call-with-temp-file

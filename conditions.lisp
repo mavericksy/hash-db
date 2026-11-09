@@ -55,5 +55,8 @@
 
 ;;; Files
 
+(define-condition persistence-error (hash-db-error) ()
+  (:documentation "Data can't be saved or restored."))
+
 (define-condition file-format-error (hash-db-error)
   ((file :initarg :file :reader error-file)))

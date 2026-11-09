@@ -27,4 +27,4 @@
     #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation
-    #:file-format-error))
+    #:file-format-error #:persistence-error))

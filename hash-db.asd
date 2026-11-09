@@ -7,6 +7,7 @@
   :description "Simple hash-table DB"
   :depends-on (#:cl-store
                #:fset
+               (:feature :sbcl (:require #:sb-posix))
                #:iterate
                #:alexandria
                #:make-hash

@@ -779,6 +779,14 @@
 
 ;; A file holds data only. A function option in a column spec (:check or
 ;; :default-fn) is saved if it is a function name, but not if it is a function object.
+;; A value that holds a function or a stream can't be restored either.
+(defun unsavable-p (obj)
+  (typecase obj
+    ((or function stream) t)
+    (cons (or (unsavable-p (car obj)) (unsavable-p (cdr obj))))
+    ((and vector (not string)) (some #'unsavable-p obj))
+    (t nil)))
+
 (defun check-savable (tables)
   (iter (for tbl in tables)
         (iter (for col in (schema tbl))
@@ -786,7 +794,53 @@
                     (when (functionp val)
                       (error 'schema-error
                              :message (format nil "Can't save column ~A of table ~A: option ~S is a function object. Use a function name."
-                                              (name col) (name tbl) key)))))))
+                                              (name col) (name tbl) key)))))
+        (fset:do-map (id row (rows tbl))
+          (when (unsavable-p row)
+            (error 'persistence-error
+                   :message (format nil "Can't save row ~A of table ~A: it holds a function or a stream"
+                                    id (name tbl)))))))
+
+;;; Safe file writes. Data goes to a temporary file first. The temporary file is
+;;; flushed to disk, then renamed over the target. A crash leaves either the
+;;; old file or the new file, never a mix. Flushing needs SBCL. Other
+;;; implementations rename without flushing.
+
+(defun native-path (path)
+  (uiop:native-namestring (merge-pathnames path)))
+
+(defun fsync-path (path)
+  #+sbcl
+  (let ((fd (sb-posix:open (native-path path) sb-posix:o-rdonly)))
+    (unwind-protect (sb-posix:fsync fd)
+      (sb-posix:close fd)))
+  #-sbcl
+  (declare (ignore path)))
+
+;; Make a rename or a new file durable. The change lives in the directory.
+(defun fsync-directory (path)
+  (fsync-path (uiop:pathname-directory-pathname (merge-pathnames path))))
+
+(defun rename-over (from to)
+  #+sbcl (sb-posix:rename (native-path from) (native-path to))
+  #-sbcl (uiop:rename-file-overwriting-target from to))
+
+;; Call WRITER with the name of a temporary file. When it returns, move the
+;; temporary file to FILE. If it fails, delete the temporary file and leave
+;; FILE as it was.
+(defun call-with-atomic-file (file writer)
+  (let* ((target (merge-pathnames file))
+         (tmp (uiop:parse-native-namestring (concatenate 'string (native-path target) ".tmp")))
+         (done nil))
+    (unwind-protect
+         (progn (funcall writer tmp)
+                (fsync-path tmp)
+                (rename-over tmp target)
+                (fsync-directory target)
+                (setf done t))
+      (unless done
+        (uiop:delete-file-if-exists tmp)))
+    target))
 
 ;; Write all committed tables to FILE. Return FILE.
 ;; Changes of an open transaction are not saved until it commits.
@@ -795,8 +849,11 @@
   (get-lock *file-lock*
     (let ((tables (all-tables (db-root *db*))))
       (check-savable tables)
-      (cl-store:store (list :hash-db +file-format-version+ (mapcar #'table-snapshot tables))
-                      file)
+      (call-with-atomic-file
+       file
+       #'(lambda (tmp)
+           (cl-store:store (list :hash-db +file-format-version+ (mapcar #'table-snapshot tables))
+                           tmp)))
       file)))
 
 ;; Replace all tables with those in FILE. Return the table names.
