@@ -419,6 +419,118 @@
       (signals schema-error (save-db path))
       (is (null (probe-file path))))))
 
+;;; referential actions
+
+(defun count-rows (table) (length (row-list table)))
+
+(defun make-owner-and-pets (on-delete)
+  (make-people)
+  (make-table "pets" (list '(:id primary-key-column)
+                           (list :owner 'foreign-key-column :references "people" :on-delete on-delete)
+                           '(:pet string)))
+  (add-people)
+  (insert-row '(:owner 1 :pet "rex") "pets")
+  (insert-row '(:owner 1 :pet "tom") "pets")
+  (insert-row '(:owner 2 :pet "kit") "pets"))
+
+(def-test delete-is-restricted-by-default (:fixture clean-db)
+  (make-people)
+  (make-pets)
+  (add-people)
+  (insert-row '(:owner 1 :pet "rex") "pets")
+  (signals foreign-key-violation (delete-row 1 "people"))
+  (is (= 3 (count-rows "people")))
+  (is (= 1 (count-rows "pets")))
+  (is-true (delete-row 1 "pets"))
+  (is-true (delete-row 1 "people"))
+  (is (= 2 (count-rows "people"))))
+
+(def-test delete-cascade (:fixture clean-db)
+  (make-owner-and-pets :cascade)
+  (is-true (delete-row 1 "people"))
+  (is (= 2 (count-rows "people")))
+  (is (equal '("kit") (mapcar (lambda (r) (getf r :pet)) (row-list "pets")))))
+
+(def-test delete-cascade-follows-several-levels (:fixture clean-db)
+  (make-owner-and-pets :cascade)
+  (make-table "toys" (list '(:id primary-key-column)
+                           (list :pet 'foreign-key-column :references "pets" :on-delete :cascade)))
+  (insert-row '(:pet 1) "toys")
+  (insert-row '(:pet 3) "toys")
+  (delete-row 1 "people")
+  (is (equal '(3) (mapcar (lambda (r) (getf r :pet)) (row-list "toys")))))
+
+(def-test delete-set-null (:fixture clean-db)
+  (make-owner-and-pets :set-null)
+  (delete-row 1 "people")
+  (is (equal '(:null :null 2) (mapcar (lambda (r) (getf r :owner)) (row-list "pets"))))
+  (is (= 3 (count-rows "pets"))))
+
+(def-test delete-cascades-through-a-self-reference (:fixture clean-db)
+  (make-table "nodes" (list '(:id primary-key-column)
+                            (list :parent 'foreign-key-column :references "nodes" :on-delete :cascade)))
+  (insert-row '() "nodes")
+  (insert-row '(:parent 1) "nodes")
+  (insert-row '(:parent 2) "nodes")
+  (insert-row '() "nodes")
+  (delete-row 1 "nodes")
+  (is (equal '(4) (mapcar (lambda (r) (getf r :id)) (row-list "nodes")))))
+
+(def-test blocked-cascade-changes-nothing (:fixture clean-db)
+  ;; people -cascade-> pets -restrict-> toys
+  (make-owner-and-pets :cascade)
+  (make-table "toys" '((:id primary-key-column) (:pet foreign-key-column :references "pets")))
+  (insert-row '(:pet 1) "toys")
+  (signals foreign-key-violation (delete-row 1 "people"))
+  (is (= 3 (count-rows "people")))
+  (is (= 3 (count-rows "pets")))
+  (is (= 1 (count-rows "toys"))))
+
+(def-test restrict-does-not-block-a-row-that-is-deleted-anyway (:fixture clean-db)
+  ;; toys refer to pets (restrict) and to people (cascade). Both go together.
+  (make-owner-and-pets :cascade)
+  (make-table "toys" (list '(:id primary-key-column)
+                           '(:pet foreign-key-column :references "pets")
+                           (list :owner 'foreign-key-column :references "people" :on-delete :cascade)))
+  (insert-row '(:pet 1 :owner 1) "toys")
+  (finishes (delete-row 1 "people"))
+  (is (= 0 (count-rows "toys")))
+  (is (= 1 (count-rows "pets"))))
+
+(def-test delete-of-a-missing-row-returns-nil (:fixture clean-db)
+  (make-people)
+  (is-false (delete-row 99 "people")))
+
+(def-test bad-on-delete-options (:fixture clean-db)
+  (make-people)
+  (signals schema-error
+    (make-table "a" '((:o foreign-key-column :references "people" :on-delete :explode))))
+  (signals schema-error
+    (make-table "b" '((:o foreign-key-column :references "people" :on-delete :set-null :not-null t))))
+  (signals schema-error
+    (make-table "c" '((:o number :on-delete :cascade)))))
+
+(def-test drop-table-is-blocked-while-referenced (:fixture clean-db)
+  (make-people)
+  (make-pets)
+  (signals schema-error (drop-table "people"))
+  (is-true (drop-table "pets"))
+  (is-true (drop-table "people")))
+
+(def-test drop-table-allows-a-self-reference (:fixture clean-db)
+  (make-table "nodes" '((:id primary-key-column) (:parent foreign-key-column :references "nodes")))
+  (is-true (drop-table "nodes")))
+
+(def-test on-delete-survives-save-and-load (:fixture clean-db)
+  (make-owner-and-pets :cascade)
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (clrhash hash-db::*global-tables*)
+      (load-db path)))
+  (delete-row 1 "people")
+  (is (= 1 (count-rows "pets"))))
+
 ;;; select
 
 (def-test select-all-rows (:fixture clean-db)

@@ -24,11 +24,19 @@
 ;; Tables lock: guards the global table registry.
 (defparameter *file-lock*   (bt:make-lock "FILE-LOCK"))
 (defparameter *tables-lock* (bt:make-lock "TABLES-LOCK"))
+;; Writer lock: one change to the data at a time, across all tables.
+;; A change that spans tables, such as a cascade, is then never mixed
+;; with another change. Always take it before a table lock.
+(defparameter *writer-lock* (bt:make-recursive-lock "WRITER-LOCK"))
 
 ;; Internal locking on tables.
 ;; The tables lock is a slot
 (defmacro get-lock (lock &body body)
   `(bt:with-lock-held (,lock)
+     ,@body))
+
+(defmacro with-writer (&body body)
+  `(bt:with-recursive-lock-held (*writer-lock*)
      ,@body))
 
 ; Global database table
@@ -57,8 +65,15 @@
     (setf (gethash name *global-tables*) db)))
 
 (defun drop-table (name)
-  (get-lock *tables-lock*
-    (remhash name *global-tables*)))
+  (with-writer
+    (get-lock *tables-lock*
+      (let ((refs (remove name (referencing-columns name)
+                          :key #'(lambda (ref) (name (car ref))) :test #'equal)))
+        (when refs
+          (error 'schema-error
+                 :message (format nil "Can't drop table ~A: table ~A refers to it"
+                                  name (name (car (first refs)))))))
+      (remhash name *global-tables*))))
 
 (defun make-rows ()
   (create-hash-table))
@@ -152,6 +167,10 @@
                        :initform nil)
    (foreign-column     :reader foreign-column
                        :initform :primary-key)
+   ;; What to do with this row when the row it refers to is deleted.
+   (on-delete          :reader on-delete
+                       :initarg :on-delete
+                       :initform :restrict)
    (equality-predicate :initform #'=)))
 
 (defclass interned-values-column (column)
@@ -164,7 +183,14 @@
 (defmethod initialize-instance :after ((col foreign-key-column) &key)
   (unless (references col)
     (error 'schema-error
-           :message (format nil "Must supply a reference table for the foreign key column ~A." (name col)))))
+           :message (format nil "Must supply a reference table for the foreign key column ~A." (name col))))
+  (unless (member (on-delete col) '(:restrict :cascade :set-null))
+    (error 'schema-error
+           :message (format nil "Option :on-delete of column ~A must be :restrict, :cascade or :set-null"
+                            (name col))))
+  (when (and (eq (on-delete col) :set-null) (not-null-p col))
+    (error 'schema-error
+           :message (format nil "Column ~A can't be :not-null with :on-delete :set-null" (name col)))))
 
 ;; A constant default value must pass the same checks as any other value.
 (defmethod initialize-instance :after ((col column) &key)
@@ -273,7 +299,7 @@
                          :type foreign-key-column
                          :value-type integer
                          :comparator #'<
-                         :extra-options (:references))
+                         :extra-options (:references :on-delete))
 
 (make-class-specific-col :class column
                          :type string
@@ -400,14 +426,15 @@
 
 ;; Add a row, return its id. A primary key column holds the id.
 (defun insert-row (name-and-values table)
-  (let ((tbl (find-table table)))
-    (get-lock (lock tbl)
-      (let* ((id (1+ (pk tbl)))
-             (row (normalise-row name-and-values (schema tbl) id)))
-        (check-unique tbl id row (unique-columns (schema tbl)))
-        (setf (pk tbl) id
-              (gethash id (rows tbl)) row)
-        id))))
+  (with-writer
+    (let ((tbl (find-table table)))
+      (get-lock (lock tbl)
+        (let* ((id (1+ (pk tbl)))
+               (row (normalise-row name-and-values (schema tbl) id)))
+          (check-unique tbl id row (unique-columns (schema tbl)))
+          (setf (pk tbl) id
+                (gethash id (rows tbl)) row)
+          id)))))
 
 (defun get-row (id table)
   (let ((tbl (find-table table)))
@@ -416,28 +443,81 @@
 
 ;; Change some columns of one row. Rows are replaced, never changed in place.
 (defun update-row (id names-and-values table)
-  (let ((tbl (find-table table)))
-    (get-lock (lock tbl)
-      (let ((old (gethash id (rows tbl))))
-        (unless old
-          (error 'no-such-row :table (name tbl) :id id
-                 :message (format nil "No row ~A in table: ~A" id (name tbl))))
-        (check-known-columns names-and-values (schema tbl))
-        (let ((new (copy-list old))
-              (changed (iter (for key in names-and-values by #'cddr)
-                             (collect (find-column key (schema tbl))))))
-          (iter (for (key val) on names-and-values by #'cddr)
-                (setf (getf new (as-keyword key))
-                      (resolve-column-value (find-column key (schema tbl)) val)))
-          (check-unique tbl id new (unique-columns changed))
-          (setf (gethash id (rows tbl)) new)
-          id)))))
+  (with-writer
+    (let ((tbl (find-table table)))
+      (get-lock (lock tbl)
+        (let ((old (gethash id (rows tbl))))
+          (unless old
+            (error 'no-such-row :table (name tbl) :id id
+                   :message (format nil "No row ~A in table: ~A" id (name tbl))))
+          (check-known-columns names-and-values (schema tbl))
+          (let ((new (copy-list old))
+                (changed (iter (for key in names-and-values by #'cddr)
+                               (collect (find-column key (schema tbl))))))
+            (iter (for (key val) on names-and-values by #'cddr)
+                  (setf (getf new (as-keyword key))
+                        (resolve-column-value (find-column key (schema tbl)) val)))
+            (check-unique tbl id new (unique-columns changed))
+            (setf (gethash id (rows tbl)) new)
+            id))))))
 
 ;; Return t if a row was removed.
 (defun delete-row (id table)
-  (let ((tbl (find-table table)))
-    (get-lock (lock tbl)
-      (remhash id (rows tbl)))))
+  (with-writer
+    (let ((tbl (find-table table)))
+      (when (nth-value 1 (gethash id (rows tbl)))
+        (multiple-value-bind (deletes nullifies) (plan-delete tbl id)
+          (apply-delete-plan deletes nullifies))
+        t))))
+
+;; All foreign key columns that refer to the table called TABLE-NAME,
+;; as a list of (table . column).
+(defun referencing-columns (table-name)
+  (iter outer (for tbl in (hash-table-values *global-tables*))
+        (iter (for col in (schema tbl))
+              (when (and (typep col 'foreign-key-column)
+                         (equal (references col) table-name))
+                (in outer (collect (cons tbl col)))))))
+
+;; Work out everything a delete of row ID changes, before it changes anything.
+;; Return two lists: rows to delete as (table . id), and rows whose foreign key
+;; column becomes NULL as (table id column). Signal foreign-key-violation if a
+;; :restrict column still refers to a row that is not deleted.
+(defun plan-delete (tbl id)
+  (let ((deletes '()) (nullifies '()) (restricts '()))
+    (flet ((planned-p (tbl id)
+             (find-if #'(lambda (d) (and (eq (car d) tbl) (eql (cdr d) id))) deletes)))
+      (labels ((visit (tbl id)
+                 (unless (planned-p tbl id)
+                   (push (cons tbl id) deletes)
+                   (dolist (ref (referencing-columns (name tbl)))
+                     (destructuring-bind (child . col) ref
+                       (iter (for (child-id row) in-hashtable (rows child))
+                             (when (eql (getf row (name col)) id)
+                               (ecase (on-delete col)
+                                 (:restrict (push (list child child-id col) restricts))
+                                 (:cascade (visit child child-id))
+                                 (:set-null (push (list child child-id col) nullifies))))))))))
+        (visit tbl id))
+      (dolist (r restricts)
+        (destructuring-bind (child child-id col) r
+          (unless (planned-p child child-id)
+            (error 'foreign-key-violation :table (name child) :column (name col)
+                   :message (format nil "Can't delete row ~A of table ~A: row ~A of table ~A refers to it"
+                                    id (name tbl) child-id (name child))))))
+      (values deletes
+              (remove-if #'(lambda (n) (planned-p (first n) (second n))) nullifies)))))
+
+(defun apply-delete-plan (deletes nullifies)
+  (dolist (n nullifies)
+    (destructuring-bind (tbl id col) n
+      (get-lock (lock tbl)
+        (let ((new (copy-list (gethash id (rows tbl)))))
+          (setf (getf new (name col)) :null)
+          (setf (gethash id (rows tbl)) new)))))
+  (dolist (d deletes)
+    (get-lock (lock (car d))
+      (remhash (cdr d) (rows (car d))))))
 
 ;; Add a column to a table. Old rows get the column default.
 (defmethod add-column ((table table) col-def)
@@ -445,28 +525,29 @@
     (when (typep col 'primary-key-column)
       (error 'schema-error
              :message "Can't add a primary key column to an existing table"))
-    (get-lock (lock table)
-      (when (find (name col) (schema table) :key #'name)
-        (error 'schema-error
-               :message (format nil "Column ~A already exists in table ~A" (name col) (name table))))
-      ;; Build every new row first, so an error leaves the table unchanged.
-      (let* ((ids (hash-table-keys (rows table)))
-             (new-rows (mapcar #'(lambda (id)
-                                   (append (gethash id (rows table))
-                                           (list (name col)
-                                                 (resolve-column-value col (column-default col)))))
-                               ids))
-             (vals (remove-if #'null-value-p
-                              (mapcar #'(lambda (row) (getf row (name col))) new-rows))))
-        (when (unique-p col)
-          (loop for (val . rest) on vals
-                when (member val rest :test (equality-predicate col))
-                  do (error 'unique-violation :table (name table) :column (name col)
-                            :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
-                                             val (name col) (name table)))))
-        (mapc #'(lambda (id row) (setf (gethash id (rows table)) row)) ids new-rows))
-      (setf (schema table) (append (schema table) (list col)))
-      col)))
+    (with-writer
+      (get-lock (lock table)
+        (when (find (name col) (schema table) :key #'name)
+          (error 'schema-error
+                 :message (format nil "Column ~A already exists in table ~A" (name col) (name table))))
+        ;; Build every new row first, so an error leaves the table unchanged.
+        (let* ((ids (hash-table-keys (rows table)))
+               (new-rows (mapcar #'(lambda (id)
+                                     (append (gethash id (rows table))
+                                             (list (name col)
+                                                   (resolve-column-value col (column-default col)))))
+                                 ids))
+               (vals (remove-if #'null-value-p
+                                (mapcar #'(lambda (row) (getf row (name col))) new-rows))))
+          (when (unique-p col)
+            (loop for (val . rest) on vals
+                  when (member val rest :test (equality-predicate col))
+                    do (error 'unique-violation :table (name table) :column (name col)
+                              :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                               val (name col) (name table)))))
+          (mapc #'(lambda (id row) (setf (gethash id (rows table)) row)) ids new-rows))
+        (setf (schema table) (append (schema table) (list col)))
+        col))))
 
 ;; Rows of a table as a list of plists, in id order.
 (defun row-list (table)
@@ -638,8 +719,9 @@
 (defun save-db (file)
   (get-lock *file-lock*
     (check-savable)
-    (let ((snapshots (get-lock *tables-lock*
-                       (mapcar #'table-snapshot (hash-table-values *global-tables*)))))
+    (let ((snapshots (with-writer
+                       (get-lock *tables-lock*
+                         (mapcar #'table-snapshot (hash-table-values *global-tables*))))))
       (cl-store:store (list :hash-db +file-format-version+ snapshots) file)
       file)))
 
@@ -653,8 +735,9 @@
         (error 'file-format-error :file file
                :message (format nil "~A is not a hash-db file" file)))
       (let ((tables (mapcar #'restore-table (third data))))
-        (get-lock *tables-lock*
-          (clrhash *global-tables*)
-          (dolist (tbl tables)
-            (setf (gethash (name tbl) *global-tables*) tbl)))
+        (with-writer
+          (get-lock *tables-lock*
+            (clrhash *global-tables*)
+            (dolist (tbl tables)
+              (setf (gethash (name tbl) *global-tables*) tbl))))
         (show-tables)))))
