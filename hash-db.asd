@@ -6,6 +6,7 @@
   :maintainer "Shaun Pearce <mavericksy@gmail.com>"
   :description "Simple hash-table DB"
   :depends-on (#:cl-store
+               #:fset
                #:iterate
                #:alexandria
                #:make-hash

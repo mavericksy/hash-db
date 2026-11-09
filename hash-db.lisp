@@ -20,17 +20,12 @@
       designator
       (make-keyword (string-upcase (string designator)))))
 
-;; Locks. File lock: one save or load at a time.
-;; Tables lock: guards the global table registry.
+;; File lock: one save or load at a time.
 (defparameter *file-lock*   (bt:make-lock "FILE-LOCK"))
-(defparameter *tables-lock* (bt:make-lock "TABLES-LOCK"))
-;; Writer lock: one change to the data at a time, across all tables.
-;; A change that spans tables, such as a cascade, is then never mixed
-;; with another change. Always take it before a table lock.
+;; Writer lock: one writer at a time. A change takes the lock, builds the new
+;; state, then swaps it in. Readers never take a lock.
 (defparameter *writer-lock* (bt:make-recursive-lock "WRITER-LOCK"))
 
-;; Internal locking on tables.
-;; The tables lock is a slot
 (defmacro get-lock (lock &body body)
   `(bt:with-lock-held (,lock)
      ,@body))
@@ -39,72 +34,118 @@
   `(bt:with-recursive-lock-held (*writer-lock*)
      ,@body))
 
-; Global database table
-(defparameter *global-tables* (create-hash-table))
+;;; Storage.
+;;; All tables of a database sit in one immutable map: table name -> table.
+;;; A table is an immutable value. A change makes a new table and a new map,
+;;; and swaps the new map in as the root. Old maps stay valid for readers
+;;; that still hold them.
+
+(defstruct (db (:constructor make-db (&optional (root (fset:empty-map)))))
+  root)
+
+(defvar *db* (make-db))
+
+;; State of the open transaction in this thread. It holds the working root.
+(defstruct (txn (:constructor make-txn (root)))
+  root)
+
+(defvar *txn* nil)
+
+;; The root this thread reads: its own working root inside a transaction,
+;; else the last committed root.
+(defun current-root ()
+  (if *txn* (txn-root *txn*) (db-root *db*)))
+
+;; Run FN as one atomic change. The new root becomes visible only when FN returns.
+;; If FN exits any other way, the change is dropped.
+(defun call-with-transaction (fn)
+  (if *txn*
+      (funcall fn)
+      (with-writer
+        (let ((*txn* (make-txn (db-root *db*))))
+          (multiple-value-prog1 (funcall fn)
+            (setf (db-root *db*) (txn-root *txn*)))))))
+
+(defmacro with-transaction (&body body)
+  `(call-with-transaction (lambda () ,@body)))
+
+;; A table is a value. Never change one. Use UPDATED-TABLE and PUT-TABLE.
+(defclass table ()
+  ((primary-key   :reader pk
+                  :initarg         :pk
+                  :initform 0
+                  :type integer)
+   (name          :reader name
+                  :initarg         :name)
+   ;; fset map: row id -> row plist
+   (row           :reader rows
+                  :initarg         :rows
+                  :initform        (fset:empty-map))
+   (schema        :reader schema
+                  :initarg         :schema
+                  :initform        nil))
+  (:documentation "A table in a database."))
+
+(defmethod get-schema ((table table))
+  (schema table))
+
+(defun create-table-instance (name schema)
+  (make-instance 'table :name name :schema schema))
+
+(defun updated-table (tbl &key (rows (rows tbl)) (pk (pk tbl)) (schema (schema tbl)))
+  (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema))
+
+;; Store TBL in the working root. Only call this inside WITH-TRANSACTION.
+(defun put-table (tbl)
+  (setf (txn-root *txn*) (fset:with (txn-root *txn*) (name tbl) tbl))
+  tbl)
+
+(defun rows-list (rows)
+  (mapcar #'cdr (fset:convert 'list rows)))
 
 (defun show-tables ()
-  (hash-table-keys *global-tables*))
+  (fset:convert 'list (fset:domain (current-root))))
 
 ;; Return a table of NAME, or nil
 (defun get-named-table (name)
-  (gethash name *global-tables*))
+  (values (fset:lookup (current-root) name)))
 
-;; Accept a table name or a table object (for example a select result).
+(defun all-tables (&optional (root (current-root)))
+  (mapcar #'(lambda (name) (values (fset:lookup root name)))
+          (fset:convert 'list (fset:domain root))))
+
+;; Accept a table name or a table value (for example a select result).
 (defun find-table (designator)
   (cond ((typep designator 'table) designator)
         ((get-named-table designator))
         (t (error 'no-such-table :table designator
                   :message (format nil "The table: ~A does not exist" designator)))))
 
-;; Push a table to the database. A duplicate name is an error.
-(defun add-table-to-global (db name)
-  (get-lock *tables-lock*
-    (when (nth-value 1 (gethash name *global-tables*))
-      (error 'table-exists :table name
-             :message (format nil "The table: ~A already exists" name)))
-    (setf (gethash name *global-tables*) db)))
+;; The stored table for a name or table value. Changes need a stored table.
+(defun stored-table (designator)
+  (let ((name (if (typep designator 'table) (name designator) designator)))
+    (or (get-named-table name)
+        (error 'no-such-table :table name
+               :message (format nil "The table: ~A does not exist" name)))))
+
+;; Add a table to the database. A duplicate name is an error.
+(defun add-table (tbl)
+  (when (nth-value 1 (fset:lookup (txn-root *txn*) (name tbl)))
+    (error 'table-exists :table (name tbl)
+           :message (format nil "The table: ~A already exists" (name tbl))))
+  (put-table tbl))
 
 (defun drop-table (name)
-  (with-writer
-    (get-lock *tables-lock*
+  (with-transaction
+    (when (get-named-table name)
       (let ((refs (remove name (referencing-columns name)
                           :key #'(lambda (ref) (name (car ref))) :test #'equal)))
         (when refs
           (error 'schema-error
                  :message (format nil "Can't drop table ~A: table ~A refers to it"
                                   name (name (car (first refs)))))))
-      (remhash name *global-tables*))))
-
-(defun make-rows ()
-  (create-hash-table))
-
-;; A table defined with a unique name and schema
-;; table locking is implemented and rows are plists in a hash-table
-;; keyed by an integer row id.
-(defclass table ()
-  ((primary-key   :accessor pk
-                  :initarg         :pk
-                  :initform 0
-                  :type integer)
-   (name          :accessor name
-                  :initarg         :name)
-   (row           :accessor rows
-                  :initarg         :rows
-                  :initform        (make-rows))
-   (schema        :accessor schema
-                  :initarg         :schema
-                  :initform        nil)
-   (lock          :accessor lock
-                  :initarg         :lock
-                  :initform        (bt:make-lock "TABLE-LOCK")))
-  (:documentation "A table in a database."))
-
-(defmethod get-schema ((table table))
-  (schema table))
-
-;; Make an instance of a table with a hash-table rowset
-(defun create-table-instance (name schema)
-  (make-instance 'table :name name :schema schema :lock (bt:make-lock (princ-to-string name))))
+      (setf (txn-root *txn*) (fset:less (txn-root *txn*) name))
+      t)))
 
 ;;; NULL is the keyword :null, so it never mixes up with false (nil).
 (defun null-value-p (val)
@@ -235,7 +276,7 @@
 ;; A foreign key value must be the id of a row in the referenced table.
 (defun check-foreign-key (table-name fk)
   (let ((target (get-named-table table-name)))
-    (if (and target (nth-value 1 (gethash fk (rows target))))
+    (if (and target (nth-value 1 (fset:lookup (rows target) fk)))
         fk
         (error 'foreign-key-violation :table table-name
                :message (format nil "Foreign key constraint violation: no row ~A in table ~A"
@@ -366,7 +407,8 @@
                     schema
                     (make-schema schema))))
     (validate-schema name schema)
-    (add-table-to-global (create-table-instance name schema) name)))
+    (with-transaction
+      (add-table (create-table-instance name schema)))))
 
 ;; Value for COL as stored: type and null checks run, then a foreign key must exist.
 (defun resolve-column-value (col val)
@@ -386,14 +428,14 @@
     (let ((val (getf row (name col)))
           (same (equality-predicate col)))
       (unless (null-value-p val)
-        (iter (for (other-id other) in-hashtable (rows tbl))
-              (let ((other-val (getf other (name col))))
-                (when (and (/= other-id id)
-                           (not (null-value-p other-val))
-                           (funcall same other-val val))
-                  (error 'unique-violation :table (name tbl) :column (name col)
-                         :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
-                                          val (name col) (name tbl))))))))))
+        (fset:do-map (other-id other (rows tbl))
+          (let ((other-val (getf other (name col))))
+            (when (and (/= other-id id)
+                       (not (null-value-p other-val))
+                       (funcall same other-val val))
+              (error 'unique-violation :table (name tbl) :column (name col)
+                     :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                      val (name col) (name tbl))))))))))
 
 (defun unique-columns (schema)
   (remove-if-not #'unique-p schema))
@@ -426,46 +468,41 @@
 
 ;; Add a row, return its id. A primary key column holds the id.
 (defun insert-row (name-and-values table)
-  (with-writer
-    (let ((tbl (find-table table)))
-      (get-lock (lock tbl)
-        (let* ((id (1+ (pk tbl)))
-               (row (normalise-row name-and-values (schema tbl) id)))
-          (check-unique tbl id row (unique-columns (schema tbl)))
-          (setf (pk tbl) id
-                (gethash id (rows tbl)) row)
-          id)))))
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (id (1+ (pk tbl)))
+           (row (normalise-row name-and-values (schema tbl) id)))
+      (check-unique tbl id row (unique-columns (schema tbl)))
+      (put-table (updated-table tbl :pk id :rows (fset:with (rows tbl) id row)))
+      id)))
 
 (defun get-row (id table)
-  (let ((tbl (find-table table)))
-    (get-lock (lock tbl)
-      (gethash id (rows tbl)))))
+  (values (fset:lookup (rows (find-table table)) id)))
 
 ;; Change some columns of one row. Rows are replaced, never changed in place.
 (defun update-row (id names-and-values table)
-  (with-writer
-    (let ((tbl (find-table table)))
-      (get-lock (lock tbl)
-        (let ((old (gethash id (rows tbl))))
-          (unless old
-            (error 'no-such-row :table (name tbl) :id id
-                   :message (format nil "No row ~A in table: ~A" id (name tbl))))
-          (check-known-columns names-and-values (schema tbl))
-          (let ((new (copy-list old))
-                (changed (iter (for key in names-and-values by #'cddr)
-                               (collect (find-column key (schema tbl))))))
-            (iter (for (key val) on names-and-values by #'cddr)
-                  (setf (getf new (as-keyword key))
-                        (resolve-column-value (find-column key (schema tbl)) val)))
-            (check-unique tbl id new (unique-columns changed))
-            (setf (gethash id (rows tbl)) new)
-            id))))))
+  (with-transaction
+    (let* ((tbl (stored-table table))
+           (old (fset:lookup (rows tbl) id)))
+      (unless old
+        (error 'no-such-row :table (name tbl) :id id
+               :message (format nil "No row ~A in table: ~A" id (name tbl))))
+      (check-known-columns names-and-values (schema tbl))
+      (let ((new (copy-list old))
+            (changed (iter (for key in names-and-values by #'cddr)
+                           (collect (find-column key (schema tbl))))))
+        (iter (for (key val) on names-and-values by #'cddr)
+              (setf (getf new (as-keyword key))
+                    (resolve-column-value (find-column key (schema tbl)) val)))
+        (check-unique tbl id new (unique-columns changed))
+        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new)))
+        id))))
 
 ;; Return t if a row was removed.
 (defun delete-row (id table)
-  (with-writer
-    (let ((tbl (find-table table)))
-      (when (nth-value 1 (gethash id (rows tbl)))
+  (with-transaction
+    (let ((tbl (stored-table table)))
+      (when (nth-value 1 (fset:lookup (rows tbl) id))
         (multiple-value-bind (deletes nullifies) (plan-delete tbl id)
           (apply-delete-plan deletes nullifies))
         t))))
@@ -473,88 +510,82 @@
 ;; All foreign key columns that refer to the table called TABLE-NAME,
 ;; as a list of (table . column).
 (defun referencing-columns (table-name)
-  (iter outer (for tbl in (hash-table-values *global-tables*))
+  (iter outer (for tbl in (all-tables))
         (iter (for col in (schema tbl))
               (when (and (typep col 'foreign-key-column)
                          (equal (references col) table-name))
                 (in outer (collect (cons tbl col)))))))
 
 ;; Work out everything a delete of row ID changes, before it changes anything.
-;; Return two lists: rows to delete as (table . id), and rows whose foreign key
-;; column becomes NULL as (table id column). Signal foreign-key-violation if a
-;; :restrict column still refers to a row that is not deleted.
+;; Return two lists: rows to delete as (table-name . id), and rows whose foreign
+;; key column becomes NULL as (table-name id column). Signal foreign-key-violation
+;; if a :restrict column still refers to a row that is not deleted.
 (defun plan-delete (tbl id)
   (let ((deletes '()) (nullifies '()) (restricts '()))
-    (flet ((planned-p (tbl id)
-             (find-if #'(lambda (d) (and (eq (car d) tbl) (eql (cdr d) id))) deletes)))
-      (labels ((visit (tbl id)
-                 (unless (planned-p tbl id)
-                   (push (cons tbl id) deletes)
-                   (dolist (ref (referencing-columns (name tbl)))
+    (flet ((planned-p (tname id)
+             (find-if #'(lambda (d) (and (equal (car d) tname) (eql (cdr d) id))) deletes)))
+      (labels ((visit (tname id)
+                 (unless (planned-p tname id)
+                   (push (cons tname id) deletes)
+                   (dolist (ref (referencing-columns tname))
                      (destructuring-bind (child . col) ref
-                       (iter (for (child-id row) in-hashtable (rows child))
-                             (when (eql (getf row (name col)) id)
-                               (ecase (on-delete col)
-                                 (:restrict (push (list child child-id col) restricts))
-                                 (:cascade (visit child child-id))
-                                 (:set-null (push (list child child-id col) nullifies))))))))))
-        (visit tbl id))
+                       (fset:do-map (child-id row (rows child))
+                         (when (eql (getf row (name col)) id)
+                           (ecase (on-delete col)
+                             (:restrict (push (list (name child) child-id col) restricts))
+                             (:cascade (visit (name child) child-id))
+                             (:set-null (push (list (name child) child-id col) nullifies))))))))))
+        (visit (name tbl) id))
       (dolist (r restricts)
-        (destructuring-bind (child child-id col) r
-          (unless (planned-p child child-id)
-            (error 'foreign-key-violation :table (name child) :column (name col)
+        (destructuring-bind (child-name child-id col) r
+          (unless (planned-p child-name child-id)
+            (error 'foreign-key-violation :table child-name :column (name col)
                    :message (format nil "Can't delete row ~A of table ~A: row ~A of table ~A refers to it"
-                                    id (name tbl) child-id (name child))))))
+                                    id (name tbl) child-id child-name)))))
       (values deletes
               (remove-if #'(lambda (n) (planned-p (first n) (second n))) nullifies)))))
 
 (defun apply-delete-plan (deletes nullifies)
   (dolist (n nullifies)
-    (destructuring-bind (tbl id col) n
-      (get-lock (lock tbl)
-        (let ((new (copy-list (gethash id (rows tbl)))))
-          (setf (getf new (name col)) :null)
-          (setf (gethash id (rows tbl)) new)))))
+    (destructuring-bind (tname id col) n
+      (let* ((tbl (stored-table tname))
+             (new (copy-list (fset:lookup (rows tbl) id))))
+        (setf (getf new (name col)) :null)
+        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new))))))
   (dolist (d deletes)
-    (get-lock (lock (car d))
-      (remhash (cdr d) (rows (car d))))))
+    (let ((tbl (stored-table (car d))))
+      (put-table (updated-table tbl :rows (fset:less (rows tbl) (cdr d)))))))
 
 ;; Add a column to a table. Old rows get the column default.
-(defmethod add-column ((table table) col-def)
+(defun add-column (table col-def)
   (let ((col (apply #'make-col col-def)))
     (when (typep col 'primary-key-column)
       (error 'schema-error
              :message "Can't add a primary key column to an existing table"))
-    (with-writer
-      (get-lock (lock table)
-        (when (find (name col) (schema table) :key #'name)
+    (with-transaction
+      (let ((tbl (stored-table table))
+            (new-rows (fset:empty-map))
+            (vals '()))
+        (when (find (name col) (schema tbl) :key #'name)
           (error 'schema-error
-                 :message (format nil "Column ~A already exists in table ~A" (name col) (name table))))
-        ;; Build every new row first, so an error leaves the table unchanged.
-        (let* ((ids (hash-table-keys (rows table)))
-               (new-rows (mapcar #'(lambda (id)
-                                     (append (gethash id (rows table))
-                                             (list (name col)
-                                                   (resolve-column-value col (column-default col)))))
-                                 ids))
-               (vals (remove-if #'null-value-p
-                                (mapcar #'(lambda (row) (getf row (name col))) new-rows))))
-          (when (unique-p col)
-            (loop for (val . rest) on vals
-                  when (member val rest :test (equality-predicate col))
-                    do (error 'unique-violation :table (name table) :column (name col)
-                              :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
-                                               val (name col) (name table)))))
-          (mapc #'(lambda (id row) (setf (gethash id (rows table)) row)) ids new-rows))
-        (setf (schema table) (append (schema table) (list col)))
+                 :message (format nil "Column ~A already exists in table ~A" (name col) (name tbl))))
+        (fset:do-map (id row (rows tbl))
+          (let ((val (resolve-column-value col (column-default col))))
+            (unless (null-value-p val) (push val vals))
+            (setf new-rows (fset:with new-rows id (append row (list (name col) val))))))
+        (when (unique-p col)
+          (loop for (val . rest) on vals
+                when (member val rest :test (equality-predicate col))
+                  do (error 'unique-violation :table (name tbl) :column (name col)
+                            :message (format nil "Duplicate value ~S in unique column ~A of table ~A"
+                                             val (name col) (name tbl)))))
+        (put-table (updated-table tbl :rows new-rows
+                                      :schema (append (schema tbl) (list col))))
         col))))
 
 ;; Rows of a table as a list of plists, in id order.
 (defun row-list (table)
-  (let ((tbl (find-table table)))
-    (get-lock (lock tbl)
-      (iter (for id in (sort (hash-table-keys (rows tbl)) #'<))
-            (collect (gethash id (rows tbl)))))))
+  (rows-list (rows (find-table table))))
 
 ;; Run a query. WHERE is a function of one row, see MATCHING.
 ;; INNER-JOIN is (table-name column-here column-there).
@@ -577,12 +608,14 @@
     (make-result-table rows schema)))
 
 (defun make-result-table (rows schema)
-  (let ((result (make-instance 'table :schema schema :name (gensym "SELECT"))))
-    (iter (for row in rows)
-          (for id from 1)
-          (setf (gethash id (rows result)) row))
-    (setf (pk result) (length rows))
-    result))
+  (make-instance 'table
+                 :schema schema
+                 :name (gensym "SELECT")
+                 :pk (length rows)
+                 :rows (fset:convert 'fset:map
+                                     (loop for row in rows
+                                           for id from 1
+                                           collect (cons id row)))))
 
 (defun mklist (thing)
   (if (listp thing) thing (list thing)))
@@ -689,25 +722,21 @@
 (defparameter +file-format-version+ 2)
 
 (defun table-snapshot (tbl)
-  (get-lock (lock tbl)
-    (list (name tbl)
-          (pk tbl)
-          (mapcar #'spec (schema tbl))
-          (iter (for (id row) in-hashtable (rows tbl))
-                (collect (cons id row))))))
+  (list (name tbl)
+        (pk tbl)
+        (mapcar #'spec (schema tbl))
+        (fset:convert 'list (rows tbl))))
 
 (defun restore-table (snapshot)
   (destructuring-bind (name pk col-specs id-rows) snapshot
-    (let ((tbl (create-table-instance name (make-schema col-specs))))
-      (setf (pk tbl) pk)
-      (dolist (id-row id-rows)
-        (setf (gethash (car id-row) (rows tbl)) (cdr id-row)))
-      tbl)))
+    (make-instance 'table :name name :pk pk
+                          :schema (make-schema col-specs)
+                          :rows (fset:convert 'fset:map id-rows))))
 
 ;; A file holds data only. A function option in a column spec (:check or
 ;; :default-fn) is saved if it is a function name, but not if it is a function object.
-(defun check-savable ()
-  (iter (for tbl in (hash-table-values *global-tables*))
+(defun check-savable (tables)
+  (iter (for tbl in tables)
         (iter (for col in (schema tbl))
               (iter (for (key val) on (cddr (spec col)) by #'cddr)
                     (when (functionp val)
@@ -715,14 +744,14 @@
                              :message (format nil "Can't save column ~A of table ~A: option ~S is a function object. Use a function name."
                                               (name col) (name tbl) key)))))))
 
-;; Write all tables to FILE. Return FILE.
+;; Write all committed tables to FILE. Return FILE.
+;; The save reads one fixed root, so writers do not wait for it.
 (defun save-db (file)
   (get-lock *file-lock*
-    (check-savable)
-    (let ((snapshots (with-writer
-                       (get-lock *tables-lock*
-                         (mapcar #'table-snapshot (hash-table-values *global-tables*))))))
-      (cl-store:store (list :hash-db +file-format-version+ snapshots) file)
+    (let ((tables (all-tables (db-root *db*))))
+      (check-savable tables)
+      (cl-store:store (list :hash-db +file-format-version+ (mapcar #'table-snapshot tables))
+                      file)
       file)))
 
 ;; Replace all tables with those in FILE. Return the table names.
@@ -734,10 +763,9 @@
                    (eql (second data) +file-format-version+))
         (error 'file-format-error :file file
                :message (format nil "~A is not a hash-db file" file)))
-      (let ((tables (mapcar #'restore-table (third data))))
+      (let ((root (fset:empty-map)))
+        (dolist (tbl (mapcar #'restore-table (third data)))
+          (setf root (fset:with root (name tbl) tbl)))
         (with-writer
-          (get-lock *tables-lock*
-            (clrhash *global-tables*)
-            (dolist (tbl tables)
-              (setf (gethash (name tbl) *global-tables*) tbl))))
+          (setf (db-root *db*) root))
         (show-tables)))))

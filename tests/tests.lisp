@@ -3,10 +3,16 @@
 (def-suite hash-db-suite :description "hash-db tests")
 (in-suite hash-db-suite)
 
-;; Each test runs against its own empty set of global tables.
+;; Each test runs against its own empty database.
 (def-fixture clean-db ()
-  (let ((hash-db::*global-tables* (hash-db::create-hash-table)))
-    (&body)))
+  (let ((old hash-db::*db*))
+    (setf hash-db::*db* (hash-db::make-db))
+    (unwind-protect (&body)
+      (setf hash-db::*db* old))))
+
+;; Remove every table without a file load.
+(defun clear-db ()
+  (setf (hash-db::db-root hash-db::*db*) (fset:empty-map)))
 
 (defun make-people ()
   (make-table "people" '((:id primary-key-column)
@@ -405,7 +411,7 @@
   (call-with-temp-file
     (lambda (path)
       (save-db path)
-      (clrhash hash-db::*global-tables*)
+      (clear-db)
       (load-db path)))
   (signals check-violation (insert-row '(:n -1) "t"))
   (signals unique-violation (insert-row '(:n 1) "t"))
@@ -526,7 +532,7 @@
   (call-with-temp-file
     (lambda (path)
       (save-db path)
-      (clrhash hash-db::*global-tables*)
+      (clear-db)
       (load-db path)))
   (delete-row 1 "people")
   (is (= 1 (count-rows "pets"))))
@@ -539,14 +545,17 @@
   (let ((result (select :from "people")))
     (is (typep result 'table))
     (is (= 3 (length (row-list result))))
-    (is (= 3 (hash-table-count (rows result))))))
+    (is (= 3 (fset:size (rows result))))))
 
-(def-test select-result-is-a-copy (:fixture clean-db)
+(def-test select-result-does-not-change-with-the-table (:fixture clean-db)
   (make-people)
   (add-people)
   (let ((result (select :from "people")))
-    (remhash 1 (rows result))
-    (is (= 3 (length (row-list "people"))))))
+    (delete-row 1 "people")
+    (insert-row '(:name "dan") "people")
+    (insert-row '(:name "eve") "people")
+    (is (= 3 (length (row-list result))))
+    (is (= 4 (length (row-list "people"))))))
 
 (def-test select-where-with-matching (:fixture clean-db)
   (make-people)
@@ -654,7 +663,7 @@
   (call-with-temp-file
     (lambda (path)
       (save-db path)
-      (clrhash hash-db::*global-tables*)
+      (clear-db)
       (is (null (show-tables)))
       (load-db path)))
   (is (equal '("people" "pets" "tags") (sort (show-tables) #'string<)))
@@ -694,5 +703,5 @@
                                       (loop for n below 200
                                             do (insert-row (list :n (+ (* i 1000) n)) tbl))))))))
     (mapc #'bt:join-thread threads)
-    (is (= 800 (hash-table-count (rows tbl))))
-    (is (= 800 (length (remove-duplicates (mapcar (lambda (r) (getf r :id)) (row-list tbl))))))))
+    (is (= 800 (fset:size (rows (find-table "t")))))
+    (is (= 800 (length (remove-duplicates (mapcar (lambda (r) (getf r :id)) (row-list "t"))))))))
