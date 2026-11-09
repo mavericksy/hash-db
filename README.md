@@ -5,7 +5,7 @@ A small in-memory database for Common Lisp. Tables hold rows in hash tables. You
 ## Requirements
 
 - SBCL and Quicklisp.
-- Quicklisp systems: `cl-store`, `iterate`, `alexandria`, `make-hash`, `bordeaux-threads`.
+- Quicklisp systems: `cl-store`, `iterate`, `alexandria`, `make-hash`, `bordeaux-threads`, `fset`.
 
 ## Load
 
@@ -78,6 +78,39 @@ A column with no value and no default holds `:null`. NULL is not the same as fal
 - A join never matches NULL.
 - `(matching "people" :age :null)` finds the rows where `age` is NULL.
 
+## Transactions
+
+`with-transaction` runs its body as one change. All of it happens, or none of it.
+
+```lisp
+(with-transaction
+  (let ((owner (insert-row '(:email "bob@x" :age 40) "people")))
+    (insert-row (list :owner owner :pet "tom") "pets")))
+```
+
+- The changes become visible when the body returns. An error or any other non-local exit drops them.
+- Inside the body, reads see the changes made so far.
+- Other threads see only committed data. They never wait for a reader.
+- Writers wait for each other. A read-modify-write inside a transaction loses no updates.
+- Each of `insert-row`, `update-row`, `delete-row`, `add-column`, `make-table` and `drop-table` is a transaction by itself.
+- A `with-transaction` inside another one is a savepoint. If it fails, only its own changes are dropped.
+- `(rollback)` leaves the innermost `with-transaction` and drops its changes. That `with-transaction` returns `nil`.
+- Dropped inserts give their row ids back.
+- `load-db` signals `transaction-error` inside a transaction.
+
+## Snapshots
+
+`with-snapshot` fixes the committed state that a thread reads. Every read in its body sees the same data, even if other threads commit meanwhile.
+
+```lisp
+(with-snapshot
+  (list (row-list "people") (row-list "pets")))   ; both from the same state
+```
+
+`select` runs in a snapshot, so a join reads both tables from the same state. Inside a transaction, `with-snapshot` does nothing.
+
+A table value is immutable. A table that `find-table` or `select` returns does not change later. Call `find-table` again to see new data. The write functions take a table name.
+
 ## Foreign keys
 
 A foreign key value must be the id of a row in the referenced table. It can be NULL unless the column is `:not-null`.
@@ -122,6 +155,7 @@ hash-db-error
   invalid-row
   query-error
   file-format-error
+  transaction-error
   constraint-violation
     not-null-violation, type-mismatch, unique-violation,
     check-violation, foreign-key-violation
@@ -138,7 +172,9 @@ Use `error-table`, `error-column`, `error-id`, `error-file` and `error-message` 
 
 ## Threads
 
-All changes take one database-wide writer lock. Readers take a table lock. A reader can see a cascade half done. Snapshot reads are planned for a later version.
+One writer runs at a time. Readers take no lock. A change builds new immutable tables, then swaps them in as one step. A reader never sees a change half done, including a cascade.
+
+`save-db` writes the last committed state. It does not block writers, and it does not save the open changes of a transaction.
 
 ## Test
 
