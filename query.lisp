@@ -5,7 +5,8 @@
 ;; Run a query.
 ;; WHERE is a function of one row (see MATCHING), the name of one, or an
 ;; expression (see expr.lisp).
-;; INNER-JOIN is (table-name column-here column-there).
+;; INNER-JOIN, LEFT-JOIN, RIGHT-JOIN, FULL-JOIN and JOINS add other tables.
+;; A join is (table-name column-here column-there). See the notes on joins below.
 ;; COL is t for all columns, one item, or a list of items. An item is a
 ;; column, or (as expression alias), or an expression. See SELECT-ITEMS.
 ;; ORDER-BY is a column, an expression key, a list of keys, or a function of
@@ -13,13 +14,13 @@
 ;; LIMIT and OFFSET cut the result after sorting.
 ;; Return a new table. Its rows are keyed 1..n in result order.
 (defun select (&key (col t) from where distinct order-by inner-join limit offset
-                 group-by having)
+                 group-by having left-join right-join full-join joins)
   (with-snapshot
     (let* ((tbl (find-table from))
            (schema (schema tbl))
            (rows (row-list tbl)))
-      (when inner-join
-        (multiple-value-setq (rows schema) (join-rows rows schema inner-join)))
+      (loop for (kind . spec) in (all-joins inner-join left-join right-join full-join joins)
+            do (multiple-value-setq (rows schema) (join-rows rows schema kind spec)))
       (when where
         (setf rows (restrict-rows rows (compile-where where schema))))
       (multiple-value-setq (rows schema)
@@ -131,25 +132,95 @@
          (end (if limit (min (+ start limit) (length rows)) (length rows))))
     (subseq rows start end)))
 
-(defun join-rows (rows schema inner-join)
-  (destructuring-bind (other-name here there) inner-join
+;;; Joins
+;;;
+;;; A join is (table here there :as prefix). HERE is a column of the rows so far,
+;;; THERE is a column of the joined table. Rows join where the two values are equal.
+;;; NULL never matches. :inner-join, :left-join, :right-join and :full-join each take
+;;; one join or a list of joins. They apply in that order. For another order, use
+;;; :joins, a list of (kind table here there :as prefix) with kind :inner, :left,
+;;; :right or :full.
+;;;
+;;; Left keeps the rows with no match and gives them NULL for the new columns. Right
+;;; keeps the unmatched rows of the joined table, with NULL for the earlier columns,
+;;; after the matched rows. Full does both.
+;;;
+;;; Two tables can't have a column with the same name. Give the joined table an
+;;; :as prefix, and its columns are named :PREFIX.COLUMN. THERE still uses the
+;;; plain name.
+
+(defun join-list (kind spec)
+  "SPEC is nil, one join, or a list of joins. Return a list of (kind . join)."
+  (cond ((null spec) nil)
+        ((consp (first spec)) (mapcar #'(lambda (join) (cons kind join)) spec))
+        (t (list (cons kind spec)))))
+
+(defun all-joins (inner-join left-join right-join full-join joins)
+  (append (join-list :inner inner-join)
+          (join-list :left left-join)
+          (join-list :right right-join)
+          (join-list :full full-join)
+          (mapcar #'(lambda (join) (cons (first join) (rest join))) joins)))
+
+(defun null-row (schema)
+  (loop for column in schema append (list (name column) :null)))
+
+(defun prefixed-name (prefix name)
+  (as-keyword (format nil "~A.~A" prefix name)))
+
+(defun join-rows (rows schema kind spec)
+  (unless (member kind '(:inner :left :right :full))
+    (error 'query-error :message (format nil "Unknown join kind ~S" kind)))
+  (unless (and (consp spec) (>= (length spec) 3) (evenp (length (cdddr spec))))
+    (error 'query-error
+           :message (format nil "A join is (table here there :as prefix), got ~S" spec)))
+  (destructuring-bind (other-name here there &key as) spec
     (let* ((other (find-table other-name))
            (here-col (find-column here schema))
            (there-col (find-column there (schema other)))
-           (other-rows (row-list other))
-           (clash (intersection (mapcar #'name schema) (mapcar #'name (schema other)))))
+           (other-schema (if as
+                             (mapcar #'(lambda (column)
+                                         (make-result-column (prefixed-name as (name column)) column))
+                                     (schema other))
+                             (schema other)))
+           (there-name (name (find-column (if as (prefixed-name as (name there-col)) (name there-col))
+                                          other-schema)))
+           (other-rows (if as
+                           (mapcar #'(lambda (row)
+                                       (loop for (key value) on row by #'cddr
+                                             append (list (prefixed-name as key) value)))
+                                   (row-list other))
+                           (row-list other)))
+           (clash (intersection (mapcar #'name schema) (mapcar #'name other-schema))))
       (when clash
         (error 'query-error
-               :message (format nil "Can't join: both tables have columns named ~A" clash)))
-      (values (loop for a in rows
-                    nconc (loop for b in other-rows
-                                when (let ((x (getf a (name here-col)))
-                                           (y (getf b (name there-col))))
-                                       (and (not (null-value-p x))
-                                            (not (null-value-p y))
-                                            (funcall (equality-predicate here-col) x y)))
-                                  collect (append a b)))
-              (append schema (schema other))))))
+               :message (format nil "Can't join: both tables have columns named ~A. Give ~A an :as prefix."
+                                clash other-name)))
+      (let* ((others (coerce other-rows 'vector))
+             (matched (make-array (length others) :initial-element nil))
+             (null-others (null-row other-schema))
+             (null-here (null-row schema))
+             (equal-p (equality-predicate here-col))
+             (result '()))
+        (dolist (row rows)
+          (let ((x (getf row (name here-col)))
+                (hit nil))
+            (unless (null-value-p x)
+              (loop for other-row across others
+                    for i from 0
+                    do (let ((y (getf other-row there-name)))
+                         (when (and (not (null-value-p y)) (funcall equal-p x y))
+                           (setf hit t
+                                 (aref matched i) t)
+                           (push (append row other-row) result)))))
+            (when (and (not hit) (member kind '(:left :full)))
+              (push (append row null-others) result))))
+        (when (member kind '(:right :full))
+          (loop for other-row across others
+                for i from 0
+                unless (aref matched i)
+                  do (push (append null-here other-row) result)))
+        (values (nreverse result) (append schema other-schema))))))
 
 (defun row-equality-tester (schema)
   (let ((names (mapcar #'name schema))
