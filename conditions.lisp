@@ -58,5 +58,13 @@
 (define-condition persistence-error (hash-db-error) ()
   (:documentation "Data can't be saved or restored."))
 
+(define-condition wal-truncated (warning)
+  ((file  :initarg :file  :reader error-file)
+   (bytes :initarg :bytes :reader truncated-bytes))
+  (:report (lambda (condition stream)
+             (format stream "Dropped ~D bytes of a damaged log tail from ~A"
+                     (truncated-bytes condition) (error-file condition))))
+  (:documentation "The log ended in a partial or damaged record. The damage was cut off."))
+
 (define-condition file-format-error (hash-db-error)
   ((file :initarg :file :reader error-file)))

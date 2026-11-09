@@ -15,7 +15,9 @@
   :serial t
   :components ((:file "package")
                (:file "conditions")
-               (:file "hash-db"))
+               (:file "hash-db")
+               ;; the write-ahead log needs SBCL: sb-posix and sb-ext
+               (:file "wal" :if-feature :sbcl))
   :in-order-to ((test-op (test-op #:hash-db/tests))))
 
 (asdf:defsystem #:hash-db/tests

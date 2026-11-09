@@ -20,11 +20,11 @@
     ;; queries
     #:select #:matching
     ;; persistence
-    #:save-db #:load-db
+    #:save-db #:load-db #:open-db #:close-db
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
     #:no-such-table #:no-such-column #:no-such-row
     #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation
-    #:file-format-error #:persistence-error))
+    #:file-format-error #:persistence-error #:wal-truncated #:truncated-bytes))

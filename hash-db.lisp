@@ -43,7 +43,11 @@
 (defstruct (db (:constructor make-db (&optional (root (fset:empty-map)))))
   root
   ;; number of the last committed transaction that changed data
-  (seq 0))
+  (seq 0)
+  ;; the write-ahead log of an open database, else nil. See wal.lisp.
+  (wal nil)
+  ;; function of (seq entries) that writes a commit to the log
+  (commit-fn nil))
 
 (defvar *db* (make-db))
 
@@ -56,14 +60,14 @@
   root
   (journal nil))
 
-(defun journal-add (entry)
-  (push entry (txn-journal *txn*)))
-
 ;; Called with (seq entries) just before a transaction commits. If it signals
 ;; an error, the transaction does not commit.
 (defvar *commit-hook* nil)
 
 (defvar *txn* nil)
+
+(defun journal-add (entry)
+  (push entry (txn-journal *txn*)))
 
 ;; The fixed root of an open WITH-SNAPSHOT in this thread.
 (defvar *snapshot* nil)
@@ -110,6 +114,8 @@
       (let ((seq (1+ (db-seq *db*))))
         (when *commit-hook*
           (funcall *commit-hook* seq entries))
+        (when (db-commit-fn *db*)
+          (funcall (db-commit-fn *db*) seq entries))
         (setf (db-seq *db*) seq)))
     (setf (db-root *db*) (txn-root *txn*))))
 
@@ -797,7 +803,7 @@
 ;;; Persistence. A file holds plain data: table names, row ids, rows and
 ;;; column specs. Locks and functions are rebuilt on load.
 
-(defparameter +file-format-version+ 2)
+(defparameter +file-format-version+ 3)
 
 (defun table-snapshot (tbl)
   (list (name tbl)
@@ -914,34 +920,56 @@
         (uiop:delete-file-if-exists tmp)))
     target))
 
+;; The committed root and its transaction number, read together.
+(defun committed-state ()
+  (with-writer
+    (values (db-root *db*) (db-seq *db*))))
+
+;; Write the tables of ROOT to FILE as the state after transaction SEQ.
+(defun write-snapshot (file root seq)
+  (let ((tables (all-tables root)))
+    (check-savable tables)
+    (call-with-atomic-file
+     file
+     #'(lambda (tmp)
+         (cl-store:store (list :hash-db +file-format-version+ seq (mapcar #'table-snapshot tables))
+                         tmp)))
+    file))
+
+;; Read a snapshot file. Return the root and the transaction number.
+(defun read-snapshot (file)
+  (flet ((bad (why)
+           (error 'file-format-error :file file
+                  :message (format nil "~A is not a hash-db file~@[ (~A)~]" file why))))
+    (let ((data (handler-case (cl-store:restore file)
+                  ((or cl-store:restore-error end-of-file) (c) (bad (princ-to-string c))))))
+      (unless (and (consp data)
+                   (eq (first data) :hash-db)
+                   (eql (second data) +file-format-version+)
+                   (integerp (third data))
+                   (listp (fourth data)))
+        (bad nil))
+      (let ((root (fset:empty-map)))
+        (dolist (tbl (mapcar #'restore-table (fourth data)))
+          (setf root (fset:with root (name tbl) tbl)))
+        (values root (third data))))))
+
 ;; Write all committed tables to FILE. Return FILE.
 ;; Changes of an open transaction are not saved until it commits.
-;; The save reads one fixed root, so writers do not wait for it.
 (defun save-db (file)
   (get-lock *file-lock*
-    (let ((tables (all-tables (db-root *db*))))
-      (check-savable tables)
-      (call-with-atomic-file
-       file
-       #'(lambda (tmp)
-           (cl-store:store (list :hash-db +file-format-version+ (mapcar #'table-snapshot tables))
-                           tmp)))
-      file)))
+    (multiple-value-bind (root seq) (committed-state)
+      (write-snapshot file root seq))))
 
 ;; Replace all tables with those in FILE. Return the table names.
 (defun load-db (file)
   (when *txn*
     (error 'transaction-error :message "Can't load a database file inside a transaction"))
+  (when (db-wal *db*)
+    (error 'persistence-error :message "Can't load a file into an open database. Call close-db first."))
   (get-lock *file-lock*
-    (let ((data (cl-store:restore file)))
-      (unless (and (consp data)
-                   (eq (first data) :hash-db)
-                   (eql (second data) +file-format-version+))
-        (error 'file-format-error :file file
-               :message (format nil "~A is not a hash-db file" file)))
-      (let ((root (fset:empty-map)))
-        (dolist (tbl (mapcar #'restore-table (third data)))
-          (setf root (fset:with root (name tbl) tbl)))
-        (with-writer
-          (setf (db-root *db*) root))
-        (show-tables)))))
+    (multiple-value-bind (root seq) (read-snapshot file)
+      (with-writer
+        (setf (db-root *db*) root
+              (db-seq *db*) seq))
+      (show-tables))))
