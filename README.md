@@ -30,6 +30,7 @@ A column is `(name type :option value ...)`. Column names are keywords. A symbol
 | `timestamp` | a universal time (integer, 0 or more) |
 | `keyword` | keywords |
 | `any` | any Lisp object. You cannot sort by it |
+| `json` | JSON text. See JSON |
 | `primary-key-column` | generated row ids. You cannot set them |
 | `foreign-key-column` | the id of a row in another table |
 
@@ -290,13 +291,157 @@ The scan step reads the index it would use, so its row count is exact. When ther
 
 `scripts/bench.lisp` times queries with and without an index on your machine.
 
+## Sequences
+
+A sequence hands out numbers one after another. It lives next to the tables and follows transactions: a number taken in a transaction that rolls back is given again.
+
+```lisp
+(create-sequence "order-numbers" :start 1000)   ; :increment can be negative
+(next-value "order-numbers")                    ; => 1000
+(current-value "order-numbers")                 ; the last number given, or nil
+(restart-sequence "order-numbers" 5000)
+(drop-sequence "order-numbers")
+(show-sequences)
+```
+
+A sequence can fill a column when you give a named function:
+
+```lisp
+(defun next-order-number () (next-value "order-numbers"))
+(make-table "orders" '((:id primary-key-column) (:no integer :default-fn next-order-number)))
+```
+
+Tables, views and sequences share one namespace. `show-tables` lists tables only.
+
+## Views
+
+A view is a stored query. It holds no rows. Each time you query it, the query runs on the data of that moment.
+
+```lisp
+(create-view "adults" :from "people" :where '(>= :age 18) :col '(:id :name) :order-by :id)
+(select :from "adults" :where '(like :name "a%"))     ; a view works where a table name does
+(drop-view "adults")
+(show-views)
+```
+
+- The arguments after the name are the arguments of `select`. The query runs once when you make the view, so a wrong table or column is an error then.
+- A view works in `:from`, in a join, in another view, in `explain`, in `matching` and in the export functions.
+- A view cannot be changed. `insert-row`, `update-where`, `create-index` and the like signal `schema-error`.
+- A view does not follow a table that is renamed or dropped. The query then fails when it runs.
+
+## Triggers
+
+A trigger is a function that runs when a row of a table is inserted, updated or deleted.
+
+```lisp
+(defun audit (event table old new)
+  (insert-row (list :what (string-downcase (string event)) :tbl table) "audit"))
+(create-trigger :audit "people" :after '(:insert :update :delete) 'audit)
+(show-triggers "people")
+(drop-trigger :audit "people")
+```
+
+The function takes the event (`:insert`, `:update` or `:delete`), the table name, the old row (nil for an insert) and the new row (nil for a delete).
+
+- A `:before` trigger runs before the change. It can return `:column value` pairs that change the new row, and the checks of the schema run on them. It can signal an error to stop the change. It may change other tables, but changing its own table is a `trigger-error`.
+- An `:after` trigger sees the new state and may do anything.
+- A trigger runs inside the transaction of the change. An error drops the whole change, and what a trigger wrote rolls back with it.
+- Cascades, `update-where`, `delete-where`, imports and purges fire triggers for each row. Replaying the log does not, because what the triggers did was logged with the change.
+- Triggers nest at most 32 levels, so a loop is a `trigger-error`.
+- Give a function name, not a lambda, if the trigger must survive a save or a restart.
+
+## Expiry
+
+```lisp
+(make-table "sessions" '((:id primary-key-column) (:user string) (:expires timestamp)))
+(set-ttl "sessions" :expires)                          ; makes an index on the column
+(insert-row (list :user "ann" :expires (expires-in 3600)) "sessions")
+(purge-expired)                                        ; => rows deleted. :table limits it to one table
+(start-sweeper :interval 60)                           ; purge in the background
+(stop-sweeper)
+```
+
+- A row whose timestamp is at or before now has expired. NULL never expires.
+- Expired rows stay in the table, and queries see them, until a purge deletes them. To hide them at once, add `(> :expires (fn get-universal-time))` to `:where`.
+- A purge is a `delete-where`: it reads only the expired rows through the index, runs cascades and triggers, is logged, and is all or nothing.
+- `*clock*` and `(now)` give the time. Set `*clock*` to test expiry. `clear-ttl` turns expiry off.
+- `start-sweeper` takes `:on-error`, a function that gets the condition when a purge fails. The sweeper goes on.
+
+## Changing tables and migrations
+
+```lisp
+(add-column "people" '(:email string :default "none"))
+(rename-column "people" :email :mail)
+(drop-column "people" :mail)
+(rename-table "people" "humans")
+```
+
+- The rows, indexes, checks, triggers and ttl follow a rename. A dropped column takes its indexes and ttl with it. The primary key and the only column of a table cannot be dropped.
+- Renaming a table also points the foreign keys of other tables, and its own self reference, at the new name.
+- A view or a trigger function that names the old column or table is not changed.
+
+`migrate` runs a function once and remembers it in the table `_migrations`.
+
+```lisp
+(migrate-all (list (list "001-people" (lambda () (make-table "people" ...)))
+                   (list "002-email"  (lambda () (add-column "people" '(:email string))))))
+;; => the ids that ran now. Call it each time the program starts.
+(applied-migrations)
+```
+
+A migration and its note are one transaction. If the function fails, nothing it did stays, and the migration is not noted.
+
+## JSON
+
+A `json` column holds JSON text. It is checked when a row is written and kept in compact form, so equal documents are equal text.
+
+```lisp
+(make-table "docs" '((:id primary-key-column) (:body json)))
+(insert-row (list :body "{\"name\": \"ann\", \"tags\": [\"a\", \"b\"]}") "docs")
+(select :from "docs" :where '(= (json-get :body "name") "ann"))
+(select :from "docs" :col '((as (json-get :body "tags" 0) :first-tag)))
+```
+
+`(json-get doc step ...)` goes down the path. A step is a string for an object key or a whole number for an array place that counts from 0. It gives a string, a number, `t`, `nil` or `:null`. For an object or array it gives the JSON text. A missing step gives `:null`.
+
+`json-decode` and `json-encode` read and write JSON in Lisp data: an object is `(:object ("key" . value) ...)`, an array is a vector, and `:true`, `:false` and `:null` are the constants.
+
+## Import and export
+
+```lisp
+(export-csv "people" "people.csv")       ; a path or a stream. :columns picks columns
+(import-csv "people" "people.csv")       ; => rows added
+(export-json "people" "people.json")
+(import-json "people" "people.json")
+```
+
+- The table can be a table name, a view, or a table value from `select`.
+- An import is one transaction: every row goes in or none does. Checks, triggers and the log apply to each row. Errors name the line or row (`import-error`).
+- CSV: an empty field is NULL and `""` is an empty string. The first line names the columns. `:columns` names them instead, and `:header nil` says there is no header line. Without both, the fields are all columns but the primary key. An empty field gives NULL, not the column default.
+- JSON: the file is an array of objects. Keys can be in any case. A json column is written as JSON, not as a string. A fraction such as 1/2 is written as a decimal.
+- Ids are generated, so values for a primary key column in a file are ignored.
+- A file path is written through a temporary file and renamed.
+
+## History
+
+```lisp
+(keep-history 100)                                   ; keep the last 100 versions in memory
+(history)                                            ; => ((:seq 41 :time 3900000000) ...)
+(with-as-of (:seq 41) (row-list "people"))
+(with-as-of (:time (- (now) 3600)) (select :from "people"))
+```
+
+Every commit that changes data makes a new version. An old version stays whole, because the new one shares what did not change. Reading it needs no copy and no replay. Inside `with-as-of` reads see the old data and any change signals `transaction-error`. For `:time`, the body sees the newest version made at or before that time.
+
+History is off by default and kept in memory only. Kept versions hold the memory of rows that later changes replaced. It starts again after a restart.
+
 ## Errors
 
 Every error that hash-db signals is a `hash-db-error`.
 
 ```
 hash-db-error
-  no-such-table, no-such-column, no-such-row
+  no-such-table, no-such-column, no-such-row, no-such-sequence
   schema-error
     table-exists
   invalid-row
@@ -304,12 +449,16 @@ hash-db-error
   file-format-error
   persistence-error
   transaction-error
+  trigger-error
+  history-error
+  json-error
+  import-error
   constraint-violation
     not-null-violation, type-mismatch, unique-violation,
     check-violation, foreign-key-violation
 ```
 
-Use `error-table`, `error-column`, `error-id`, `error-file` and `error-message` to read the details.
+Use `error-table`, `error-column`, `error-id`, `error-file`, `error-name`, `error-line` and `error-message` to read the details.
 
 ## Durability
 
@@ -330,6 +479,7 @@ Use `error-table`, `error-column`, `error-id`, `error-file` and `error-message` 
 - After a crash, the log can end in a partial record. `open-db` cuts it off and signals the warning `wal-truncated`. Everything before the damage is kept. If a record in the middle is damaged, the records after it are lost too.
 - A jump in transaction numbers in the log signals `persistence-error`, because data is missing.
 - Values must print and read back. Strings, numbers, keywords, symbols, lists and vectors do. A function, a stream or a hash table does not, and the commit fails with `persistence-error`.
+- Sequences, views, triggers, ttl and indexes are saved and logged like tables. A view or trigger that holds a lambda works in memory. A save or a logged commit refuses it with `persistence-error`. Use function names.
 - `save-db` and `load-db` stay for plain snapshots. `save-db` refuses the snapshot of the open database. `load-db` refuses an open database.
 
 Limits:
