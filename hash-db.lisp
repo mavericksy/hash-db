@@ -41,13 +41,27 @@
 ;;; that still hold them.
 
 (defstruct (db (:constructor make-db (&optional (root (fset:empty-map)))))
-  root)
+  root
+  ;; number of the last committed transaction that changed data
+  (seq 0))
 
 (defvar *db* (make-db))
 
-;; State of the open transaction in this thread. It holds the working root.
+;; State of the open transaction in this thread. It holds the working root and
+;; the journal: what the transaction changed, newest entry first.
+;; Entries are plain data: (:create-table name specs), (:drop-table name),
+;; (:insert table id row), (:update table id row), (:delete table id) and
+;; (:add-column table spec id-rows). REPLAY-ENTRIES applies them to a root.
 (defstruct (txn (:constructor make-txn (root)))
-  root)
+  root
+  (journal nil))
+
+(defun journal-add (entry)
+  (push entry (txn-journal *txn*)))
+
+;; Called with (seq entries) just before a transaction commits. If it signals
+;; an error, the transaction does not commit.
+(defvar *commit-hook* nil)
 
 (defvar *txn* nil)
 
@@ -86,17 +100,30 @@
         (let ((*txn* (make-txn (db-root *db*))))
           (catch 'rollback
             (multiple-value-prog1 (funcall fn)
-              (setf (db-root *db*) (txn-root *txn*))))))))
+              (commit-transaction)))))))
+
+;; Make the working root the committed root. A transaction that changed
+;; data gets the next number and is passed to the commit hook first.
+(defun commit-transaction ()
+  (let ((entries (reverse (txn-journal *txn*))))
+    (when entries
+      (let ((seq (1+ (db-seq *db*))))
+        (when *commit-hook*
+          (funcall *commit-hook* seq entries))
+        (setf (db-seq *db*) seq)))
+    (setf (db-root *db*) (txn-root *txn*))))
 
 (defun call-with-savepoint (fn)
   (let ((saved (txn-root *txn*))
+        (saved-journal (txn-journal *txn*))
         (done nil))
     (unwind-protect
          (catch 'rollback
            (multiple-value-prog1 (funcall fn)
              (setf done t)))
       (unless done
-        (setf (txn-root *txn*) saved)))))
+        (setf (txn-root *txn*) saved
+              (txn-journal *txn*) saved-journal)))))
 
 ;; Run BODY as one change. All of it happens, or none of it.
 ;; Return the values of BODY.
@@ -174,6 +201,7 @@
   (when (nth-value 1 (fset:lookup (txn-root *txn*) (name tbl)))
     (error 'table-exists :table (name tbl)
            :message (format nil "The table: ~A already exists" (name tbl))))
+  (journal-add (list :create-table (name tbl) (mapcar #'spec (schema tbl))))
   (put-table tbl))
 
 (defun drop-table (name)
@@ -186,6 +214,7 @@
                  :message (format nil "Can't drop table ~A: table ~A refers to it"
                                   name (name (car (first refs)))))))
       (setf (txn-root *txn*) (fset:less (txn-root *txn*) name))
+      (journal-add (list :drop-table name))
       t)))
 
 ;;; NULL is the keyword :null, so it never mixes up with false (nil).
@@ -517,6 +546,7 @@
            (row (normalise-row name-and-values (schema tbl) id)))
       (check-unique tbl id row (unique-columns (schema tbl)))
       (put-table (updated-table tbl :pk id :rows (fset:with (rows tbl) id row)))
+      (journal-add (list :insert (name tbl) id row))
       id)))
 
 (defun get-row (id table)
@@ -539,6 +569,7 @@
                     (resolve-column-value (find-column key (schema tbl)) val)))
         (check-unique tbl id new (unique-columns changed))
         (put-table (updated-table tbl :rows (fset:with (rows tbl) id new)))
+        (journal-add (list :update (name tbl) id new))
         id))))
 
 ;; Return t if a row was removed.
@@ -594,10 +625,12 @@
       (let* ((tbl (stored-table tname))
              (new (copy-list (fset:lookup (rows tbl) id))))
         (setf (getf new (name col)) :null)
-        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new))))))
+        (put-table (updated-table tbl :rows (fset:with (rows tbl) id new)))
+        (journal-add (list :update tname id new)))))
   (dolist (d deletes)
     (let ((tbl (stored-table (car d))))
-      (put-table (updated-table tbl :rows (fset:less (rows tbl) (cdr d)))))))
+      (put-table (updated-table tbl :rows (fset:less (rows tbl) (cdr d))))
+      (journal-add (list :delete (car d) (cdr d))))))
 
 ;; Add a column to a table. Old rows get the column default.
 (defun add-column (table col-def)
@@ -624,6 +657,7 @@
                                              val (name col) (name tbl)))))
         (put-table (updated-table tbl :rows new-rows
                                       :schema (append (schema tbl) (list col))))
+        (journal-add (list :add-column (name tbl) (spec col) (fset:convert 'list new-rows)))
         col))))
 
 ;; Rows of a table as a list of plists, in id order.
@@ -800,6 +834,44 @@
             (error 'persistence-error
                    :message (format nil "Can't save row ~A of table ~A: it holds a function or a stream"
                                     id (name tbl)))))))
+
+;;; Replay. Apply journal entries to a root and return the new root. Entries
+;;; were checked when they first ran, so replay does not check them again.
+
+(defun replay-entry (root entry)
+  (flet ((table-named (name)
+           (or (values (fset:lookup root name))
+               (error 'persistence-error
+                      :message (format nil "Log entry ~S refers to a missing table" entry)))))
+    (ecase (first entry)
+      (:create-table
+       (destructuring-bind (name specs) (rest entry)
+         (fset:with root name (create-table-instance name (make-schema specs)))))
+      (:drop-table
+       (fset:less root (second entry)))
+      (:insert
+       (destructuring-bind (name id row) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name (updated-table tbl :pk id :rows (fset:with (rows tbl) id row))))))
+      (:update
+       (destructuring-bind (name id row) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name (updated-table tbl :rows (fset:with (rows tbl) id row))))))
+      (:delete
+       (destructuring-bind (name id) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name (updated-table tbl :rows (fset:less (rows tbl) id))))))
+      (:add-column
+       (destructuring-bind (name spec id-rows) (rest entry)
+         (let ((tbl (table-named name)))
+           (fset:with root name
+                      (updated-table tbl
+                                     :schema (append (schema tbl) (list (apply #'make-col spec)))
+                                     :rows (fset:convert 'fset:map id-rows)))))))))
+
+(defun replay-entries (root entries)
+  (dolist (entry entries root)
+    (setf root (replay-entry root entry))))
 
 ;;; Safe file writes. Data goes to a temporary file first. The temporary file is
 ;;; flushed to disk, then renamed over the target. A crash leaves either the

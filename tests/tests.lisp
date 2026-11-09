@@ -951,3 +951,55 @@
     (mapc #'bt:join-thread threads)
     (is (= 800 (fset:size (rows (find-table "t")))))
     (is (= 800 (length (remove-duplicates (mapcar (lambda (r) (getf r :id)) (row-list "t"))))))))
+
+;;; journal
+
+(defun table-states (root)
+  (mapcar (lambda (tbl)
+            (list (name tbl) (hash-db::pk tbl) (mapcar #'hash-db::spec (schema tbl))
+                  (fset:convert 'list (rows tbl))))
+          (hash-db::all-tables root)))
+
+(def-test replaying-the-journal-rebuilds-the-database (:fixture clean-db)
+  (let ((records '()))
+    (let ((hash-db::*commit-hook* (lambda (seq entries) (push (cons seq entries) records))))
+      (make-people)
+      (make-table "pets" (list '(:id primary-key-column)
+                               (list :owner 'foreign-key-column :references "people" :on-delete :cascade)
+                               '(:pet string :unique t)))
+      (add-people)
+      (insert-row '(:owner 1 :pet "rex") "pets")
+      (insert-row '(:owner 2 :pet "tom") "pets")
+      (update-row 1 '(:age 31 :active nil) "people")
+      (with-transaction
+        (insert-row '(:name "dan" :age 5) "people")
+        (insert-row '(:owner 4 :pet "kit") "pets"))
+      (ignore-errors (insert-row '(:owner 1 :pet "rex") "pets"))      ; unique violation
+      (with-transaction (insert-row '(:name "gone") "people") (rollback))
+      (get-row 1 "people")                                            ; a read changes nothing
+      (add-column (find-table "people") '(:city string :default "paris"))
+      (delete-row 1 "people")                                         ; cascades to pets
+      (delete-row 4 "people")
+      (make-table "scratch" '((:a number)))
+      (insert-row '(:a 1) "scratch")
+      (drop-table "scratch"))
+    (is (equal (loop for i from 1 to (length records) collect i)
+               (mapcar #'car (reverse records)))
+        "numbers are 1, 2, 3 ... with no gap for failed, rolled back or read-only work")
+    (is (= 15 (length records)))
+    (let ((root (fset:empty-map)))
+      (dolist (record (reverse records))
+        (setf root (hash-db::replay-entries root (cdr record))))
+      (is (equal (table-states (hash-db::db-root hash-db::*db*)) (table-states root))))))
+
+(def-test savepoint-drops-journal-entries (:fixture clean-db)
+  (make-people)
+  (let ((records '()))
+    (let ((hash-db::*commit-hook* (lambda (seq entries) (push (cons seq entries) records))))
+      (with-transaction
+        (insert-row '(:name "a") "people")
+        (with-transaction (insert-row '(:name "b") "people") (rollback))
+        (insert-row '(:name "c") "people")))
+    (is (equal '((:insert "people" 1 (:id 1 :name "a" :age :null :active :null))
+                 (:insert "people" 2 (:id 2 :name "c" :age :null :active :null)))
+               (cdr (first records))))))
