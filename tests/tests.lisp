@@ -874,6 +874,17 @@
   (signals not-null-violation (insert-row '() "tags"))
   (is (= 2 (length (row-list (select :from "people" :where (matching "people" :age 30)))))))
 
+(def-test interned-column-still-works-after-load (:fixture clean-db)
+  (make-table "tags" '((:tag interned-string :unique t)))
+  (insert-row (list :tag (copy-seq "red")) "tags")
+  (call-with-temp-file
+    (lambda (path)
+      (save-db path)
+      (clear-db)
+      (load-db path)))
+  (is (= 1 (count-rows (select :from "tags" :where (matching "tags" :tag (copy-seq "red"))))))
+  (signals unique-violation (insert-row (list :tag (copy-seq "red")) "tags")))
+
 (def-test load-replaces-existing-tables (:fixture clean-db)
   (make-people)
   (call-with-temp-file

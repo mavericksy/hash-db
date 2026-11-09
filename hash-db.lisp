@@ -258,7 +258,9 @@
 (defclass interned-values-column (column)
   ((interned-values    :reader interned-values
                        :initform (create-hash-table))
-   (equality-predicate :initform #'eql)
+   ;; Interning saves memory. Equality must not depend on it, because
+   ;; rows loaded from a file hold strings that were never interned.
+   (equality-predicate :initform #'string=)
    (not-null           :initform t)
    (value-normaliser   :initform #'intern-for-column)))
 
