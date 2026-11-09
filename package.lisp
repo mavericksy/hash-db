@@ -15,6 +15,8 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; triggers
+    #:create-trigger #:drop-trigger #:show-triggers
     ;; views
     #:create-view #:drop-view #:show-views
     ;; sequences
@@ -31,7 +33,7 @@
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
     #:no-such-table #:no-such-column #:no-such-row #:no-such-sequence #:error-name
-    #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error
+    #:schema-error #:table-exists #:invalid-row #:query-error #:transaction-error #:trigger-error
     #:constraint-violation #:not-null-violation #:type-mismatch #:unique-violation #:check-violation
     #:foreign-key-violation
     #:file-format-error #:persistence-error #:wal-truncated #:truncated-bytes))

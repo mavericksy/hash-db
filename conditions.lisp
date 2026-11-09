@@ -40,6 +40,9 @@
 (define-condition query-error (hash-db-error) ()
   (:documentation "A query is not valid."))
 
+(define-condition trigger-error (hash-db-error) ()
+  (:documentation "A trigger loops, or does what a trigger may not do."))
+
 (define-condition transaction-error (hash-db-error) ()
   (:documentation "A transaction function was used in the wrong place."))
 

@@ -168,6 +168,10 @@
    ;; list of INDEX structures. See the section on indexes.
    (indexes       :reader indexes
                   :initarg         :indexes
+                  :initform        nil)
+   ;; list of TRIGGER structures. See the section on triggers.
+   (triggers      :reader triggers
+                  :initarg         :triggers
                   :initform        nil))
   (:documentation "A table in a database."))
 
@@ -178,8 +182,9 @@
   (ensure-implicit-indexes (make-instance 'table :name name :schema schema)))
 
 (defun updated-table (tbl &key (rows (rows tbl)) (pk (pk tbl)) (schema (schema tbl))
-                            (indexes (indexes tbl)))
-  (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema :indexes indexes))
+                            (indexes (indexes tbl)) (triggers (triggers tbl)))
+  (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema :indexes indexes
+                        :triggers triggers))
 
 ;; Store or remove any named thing in the working root. Only inside WITH-TRANSACTION.
 (defun put-object (name object)
@@ -825,14 +830,81 @@
                      (resolve-column-value col (supplied-or-default names-and-values col))))))
 
 ;; Add a row, return its id. A primary key column holds the id.
+;;; Triggers
+;;;
+;;; A trigger is a function that runs when a row of a table is inserted, updated or
+;;; deleted. See triggers.lisp for how to make one. The function takes four
+;;; arguments: the event (:insert, :update or :delete), the table name, the old row
+;;; (nil for an insert) and the new row (nil for a delete).
+;;;
+;;; A :before trigger runs before the change is made. It can return a list of
+;;; :column value pairs. These change the new row, and the usual checks run on them.
+;;; It can signal an error to stop the change. It may change other tables, but
+;;; not its own table: that is a trigger-error. An :after trigger runs after the
+;;; change and may do anything. Triggers run inside the transaction of the change.
+;;; If one signals an error, the whole change is dropped. A change made by a cascade
+;;; fires triggers too. Replaying the log does not, because what the triggers did
+;;; was logged with the change.
+
+(defstruct (trigger (:constructor make-trigger (name timing events function)))
+  name
+  timing
+  events
+  function)
+
+(defparameter *max-trigger-depth* 32)
+(defvar *trigger-depth* 0)
+
+(defun matching-triggers (tbl timing event)
+  (remove-if-not #'(lambda (trigger)
+                     (and (eq (trigger-timing trigger) timing)
+                          (member event (trigger-events trigger))))
+                 (triggers tbl)))
+
+(defun call-trigger (trigger tbl event old new)
+  (let ((*trigger-depth* (1+ *trigger-depth*)))
+    (when (> *trigger-depth* *max-trigger-depth*)
+      (error 'trigger-error
+             :message (format nil "Trigger ~A on table ~A runs more than ~D levels deep. Does it call itself?"
+                              (trigger-name trigger) (name tbl) *max-trigger-depth*)))
+    (funcall (trigger-function trigger) event (name tbl) old new)))
+
+;; The new row with changes from a list of :column value pairs. The checks of the
+;; schema run on the changed columns. The primary key can't be changed.
+(defun row-with-changes (tbl row changes)
+  (check-known-columns changes (schema tbl))
+  (let ((new (copy-list row)))
+    (iter (for (key val) on changes by #'cddr)
+          (setf (getf new (as-keyword key))
+                (resolve-column-value (find-column key (schema tbl)) val)))
+    new))
+
+;; Run the :before triggers. Return the new row with their changes.
+(defun fire-before (tbl event old new)
+  (let ((triggers (matching-triggers tbl :before event)))
+    (dolist (trigger triggers)
+      (let ((changes (call-trigger trigger tbl event old new)))
+        (when (and changes new)
+          (setf new (row-with-changes tbl new changes)))))
+    (when (and triggers (not (eq (stored-table (name tbl)) tbl)))
+      (error 'trigger-error
+             :message (format nil "A :before trigger changed its own table ~A. Use an :after trigger for that."
+                              (name tbl))))
+    new))
+
+(defun fire-after (tbl event old new)
+  (dolist (trigger (matching-triggers tbl :after event))
+    (call-trigger trigger tbl event old new)))
+
 (defun insert-row (name-and-values table)
   (with-transaction
     (let* ((tbl (stored-table table))
            (id (1+ (pk tbl)))
-           (row (normalise-row name-and-values (schema tbl) id)))
+           (row (fire-before tbl :insert nil (normalise-row name-and-values (schema tbl) id))))
       (check-unique tbl id row)
       (put-table (table-with-row tbl id row :pk id))
       (journal-add (list :insert (name tbl) id row))
+      (fire-after tbl :insert nil row)
       id)))
 
 (defun get-row (id table)
@@ -846,14 +918,11 @@
       (unless old
         (error 'no-such-row :table (name tbl) :id id
                :message (format nil "No row ~A in table: ~A" id (name tbl))))
-      (check-known-columns names-and-values (schema tbl))
-      (let ((new (copy-list old)))
-        (iter (for (key val) on names-and-values by #'cddr)
-              (setf (getf new (as-keyword key))
-                    (resolve-column-value (find-column key (schema tbl)) val)))
+      (let ((new (fire-before tbl :update old (row-with-changes tbl old names-and-values))))
         (check-unique tbl id new)
         (put-table (table-with-row tbl id new))
         (journal-add (list :update (name tbl) id new))
+        (fire-after tbl :update old new)
         id))))
 
 ;; Return t if a row was removed.
@@ -906,14 +975,24 @@
   (dolist (n nullifies)
     (destructuring-bind (tname id col) n
       (let* ((tbl (stored-table tname))
-             (new (copy-list (fset:lookup (rows tbl) id))))
-        (setf (getf new (name col)) :null)
-        (put-table (table-with-row tbl id new))
-        (journal-add (list :update tname id new)))))
+             (old (fset:lookup (rows tbl) id)))
+        ;; a trigger may have deleted the row already
+        (when old
+          (let ((new (fire-before tbl :update old
+                                  (let ((row (copy-list old)))
+                                    (setf (getf row (name col)) :null)
+                                    row))))
+            (put-table (table-with-row tbl id new))
+            (journal-add (list :update tname id new))
+            (fire-after tbl :update old new))))))
   (dolist (d deletes)
-    (let ((tbl (stored-table (car d))))
-      (put-table (table-without-row tbl (cdr d)))
-      (journal-add (list :delete (car d) (cdr d))))))
+    (let* ((tbl (stored-table (car d)))
+           (old (fset:lookup (rows tbl) (cdr d))))
+      (when old
+        (fire-before tbl :delete old nil)
+        (put-table (table-without-row tbl (cdr d)))
+        (journal-add (list :delete (car d) (cdr d)))
+        (fire-after tbl :delete old nil)))))
 
 ;; Add a column to a table. Old rows get the column default.
 (defun add-column (table col-def)
@@ -959,14 +1038,19 @@
         ;; only the indexes that CREATE-INDEX made. The others come from the schema.
         (loop for ix in (indexes tbl)
               when (index-explicit ix)
-                collect (list (index-name ix) (index-column ix) (and (index-unique ix) t)))))
+                collect (list (index-name ix) (index-column ix) (and (index-unique ix) t)))
+        (loop for trigger in (triggers tbl)
+              collect (list (trigger-name trigger) (trigger-timing trigger)
+                            (trigger-events trigger) (trigger-function trigger)))))
 
 (defun restore-table (snapshot)
-  (destructuring-bind (name pk col-specs id-rows &optional index-specs) snapshot
+  (destructuring-bind (name pk col-specs id-rows &optional index-specs trigger-specs) snapshot
     (let ((tbl (ensure-implicit-indexes
                 (make-instance 'table :name name :pk pk
                                       :schema (make-schema col-specs)
-                                      :rows (fset:convert 'fset:map id-rows)))))
+                                      :rows (fset:convert 'fset:map id-rows)
+                                      :triggers (mapcar #'(lambda (spec) (apply #'make-trigger spec))
+                                                        trigger-specs)))))
       (dolist (spec index-specs tbl)
         (destructuring-bind (index-name column unique) spec
           (setf tbl (updated-table tbl :indexes (append (indexes tbl)
