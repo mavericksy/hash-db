@@ -16,6 +16,7 @@
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
     ;; sql
+    #:sql-expression
     #:sql-error #:error-position #:error-sql
     ;; history
     #:keep-history #:history #:with-as-of #:history-error
