@@ -1,10 +1,3 @@
-(in-package #:cl-user)
-
-(defpackage #:hash-db-system
-  (:use #:cl #:asdf))
-
-(in-package #:hash-db-system)
-
 (defpackage #:hash-db
   (:use
     #:cl
@@ -12,14 +5,16 @@
     #:bordeaux-threads
     #:cl-store
     #:alexandria)
-  (:export #:make-class-specific-col
-           #:show-tables
-           #:insert-row
-           #:make-schema
-           #:make-table
-           #:select
-           #:get-named-database
-           #:get-schema
-           #:save-db
-           #:load-db
-           ))
+  (:export
+    ;; tables
+    #:table #:make-table #:drop-table #:show-tables #:get-named-table #:find-table
+    #:name #:rows #:schema #:get-schema #:add-column
+    ;; schema and columns
+    #:make-schema #:make-col #:make-class-specific-col
+    #:primary-key-column #:foreign-key-column #:interned-string
+    ;; rows
+    #:insert-row #:get-row #:update-row #:delete-row #:row-list
+    ;; queries
+    #:select #:matching
+    ;; persistence
+    #:save-db #:load-db))
