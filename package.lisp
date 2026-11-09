@@ -15,6 +15,9 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; changing tables and migrations
+    #:rename-table #:rename-column #:drop-column #:migrate #:migrate-all
+    #:applied-migrations
     ;; expiry
     #:set-ttl #:clear-ttl #:ttl-column #:purge-expired #:expires-in #:now #:*clock*
     #:start-sweeper #:stop-sweeper
