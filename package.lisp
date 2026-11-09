@@ -17,4 +17,10 @@
     ;; queries
     #:select #:matching
     ;; persistence
-    #:save-db #:load-db))
+    #:save-db #:load-db
+    ;; conditions
+    #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
+    #:no-such-table #:no-such-column #:no-such-row
+    #:schema-error #:table-exists #:invalid-row #:query-error
+    #:constraint-violation #:not-null-violation #:foreign-key-violation
+    #:file-format-error))

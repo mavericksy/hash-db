@@ -45,13 +45,15 @@
 (defun find-table (designator)
   (cond ((typep designator 'table) designator)
         ((get-named-table designator))
-        (t (error "The table: ~A does not exist" designator))))
+        (t (error 'no-such-table :table designator
+                  :message (format nil "The table: ~A does not exist" designator)))))
 
 ;; Push a table to the database. A duplicate name is an error.
 (defun add-table-to-global (db name)
   (get-lock *tables-lock*
     (when (nth-value 1 (gethash name *global-tables*))
-      (error "The table: ~A already exists" name))
+      (error 'table-exists :table name
+             :message (format nil "The table: ~A already exists" name)))
     (setf (gethash name *global-tables*) db)))
 
 (defun drop-table (name)
@@ -90,7 +92,8 @@
   (make-instance 'table :name name :schema schema :lock (bt:make-lock (princ-to-string name))))
 
 (defun not-nullable (val col)
-  (or val (error "Column ~A can't be null" (name col))))
+  (or val (error 'not-null-violation :column (name col)
+                      :message (format nil "Column ~A can't be null" (name col)))))
 
 (defun keep-value (val col)
   (declare (ignore col))
@@ -132,7 +135,8 @@
 
 (defmethod initialize-instance :after ((col foreign-key-column) &key)
   (unless (references col)
-    (error "Must supply a reference table for the foreign key column ~A." (name col))))
+    (error 'schema-error
+           :message (format nil "Must supply a reference table for the foreign key column ~A." (name col)))))
 
 (defclass interned-values-column (column)
   ((interned-values    :reader interned-values
@@ -150,13 +154,15 @@
   (let ((target (get-named-table table-name)))
     (if (and target (nth-value 1 (gethash fk (rows target))))
         fk
-        (error "Foreign key constraint violation: no row ~A in table ~A" fk table-name))))
+        (error 'foreign-key-violation :table table-name
+               :message (format nil "Foreign key constraint violation: no row ~A in table ~A"
+                                fk table-name)))))
 
 (defgeneric make-col (name type &optional default-value references))
 
 (defmethod make-col (name type &optional default-value references)
   (declare (ignore name default-value references))
-  (error "Unknown column type: ~A" type))
+  (error 'schema-error :message (format nil "Unknown column type: ~A" type)))
 
 ;; Create a class specific column to store instances of that class
 ;;
@@ -216,9 +222,11 @@
 (defun validate-schema (table-name schema)
   (let ((names (mapcar #'name schema)))
     (unless (= (length names) (length (remove-duplicates names)))
-      (error "Duplicate column names in table ~A: ~A" table-name names))
+      (error 'schema-error
+             :message (format nil "Duplicate column names in table ~A: ~A" table-name names)))
     (when (> (count-if (lambda (c) (typep c 'primary-key-column)) schema) 1)
-      (error "Table ~A has more than one primary key column" table-name))))
+      (error 'schema-error
+             :message (format nil "Table ~A has more than one primary key column" table-name)))))
 
 (defun make-table (name schema)
   (let ((schema (if (every (lambda (c) (typep c 'column)) schema)
@@ -238,14 +246,17 @@
 
 (defun find-column (col-name schema)
   (or (find (as-keyword col-name) schema :key #'name)
-      (error "No column: ~A in schema: ~A" col-name (mapcar #'name schema))))
+      (error 'no-such-column :column col-name
+             :message (format nil "No column: ~A in schema: ~A" col-name (mapcar #'name schema)))))
 
 (defun check-known-columns (names-and-values schema)
   (unless (evenp (length names-and-values))
-    (error "Malformed row, expected :column value pairs: ~S" names-and-values))
+    (error 'invalid-row
+           :message (format nil "Malformed row, expected :column value pairs: ~S" names-and-values)))
   (iter (for key in names-and-values by #'cddr)
         (when (typep (find-column key schema) 'primary-key-column)
-          (error "Column ~A is a generated primary key" key))))
+          (error 'invalid-row
+                 :message (format nil "Column ~A is a generated primary key" key)))))
 
 (defun supplied-or-default (names-and-values col)
   (let ((val (getf names-and-values (name col) '%missing)))
@@ -280,7 +291,8 @@
     (get-lock (lock tbl)
       (let ((old (gethash id (rows tbl))))
         (unless old
-          (error "No row ~A in table: ~A" id (name tbl)))
+          (error 'no-such-row :table (name tbl) :id id
+                 :message (format nil "No row ~A in table: ~A" id (name tbl))))
         (check-known-columns names-and-values (schema tbl))
         (let ((new (copy-list old)))
           (iter (for (key val) on names-and-values by #'cddr)
@@ -299,10 +311,12 @@
 (defmethod add-column ((table table) col-def)
   (let ((col (apply #'make-col col-def)))
     (when (typep col 'primary-key-column)
-      (error "Can't add a primary key column to an existing table"))
+      (error 'schema-error
+             :message "Can't add a primary key column to an existing table"))
     (get-lock (lock table)
       (when (find (name col) (schema table) :key #'name)
-        (error "Column ~A already exists in table ~A" (name col) (name table)))
+        (error 'schema-error
+               :message (format nil "Column ~A already exists in table ~A" (name col) (name table))))
       (let ((val (resolve-column-value col (default-value col))))
         (dolist (id (hash-table-keys (rows table)))
           (setf (gethash id (rows table))
@@ -371,7 +385,8 @@
            (other-rows (row-list other))
            (clash (intersection (mapcar #'name schema) (mapcar #'name (schema other)))))
       (when clash
-        (error "Can't join: both tables have columns named ~A" clash))
+        (error 'query-error
+               :message (format nil "Can't join: both tables have columns named ~A" clash)))
       (values (loop for a in rows
                     nconc (loop for b in other-rows
                                 when (funcall (equality-predicate here-col)
@@ -397,7 +412,8 @@
   (let* ((names (mapcar #'as-keyword col-names))
          (comparators (mapcar #'(lambda (col)
                                   (or (comparator col)
-                                      (error "Column ~A has no comparator" (name col))))
+                                      (error 'query-error
+                                             :message (format nil "Column ~A has no comparator" (name col)))))
                               (extract-schema names schema))))
     #'(lambda (a b)
         (loop for name in names
@@ -464,7 +480,8 @@
       (unless (and (consp data)
                    (eq (first data) :hash-db)
                    (eql (second data) +file-format-version+))
-        (error "~A is not a hash-db file" file))
+        (error 'file-format-error :file file
+               :message (format nil "~A is not a hash-db file" file)))
       (let ((tables (mapcar #'restore-table (third data))))
         (get-lock *tables-lock*
           (clrhash *global-tables*)

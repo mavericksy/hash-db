@@ -12,6 +12,7 @@
                #:bordeaux-threads)
   :serial t
   :components ((:file "package")
+               (:file "conditions")
                (:file "hash-db"))
   :in-order-to ((test-op (test-op #:hash-db/tests))))
 

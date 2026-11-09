@@ -24,6 +24,24 @@
         (insert-row '(:name "bob" :age 25 :active nil) "people")
         (insert-row '(:name "cat" :age 30 :active t) "people")))
 
+;;; conditions
+
+(def-test all-errors-share-one-parent (:fixture clean-db)
+  (make-people)
+  (dolist (thunk (list (lambda () (insert-row '() "no-such-table"))
+                       (lambda () (insert-row '(:nope 1) "people"))
+                       (lambda () (make-people))))
+    (signals hash-db-error (funcall thunk))))
+
+(def-test conditions-carry-data (:fixture clean-db)
+  (make-people)
+  (handler-case (insert-row '(:nope 1) "people")
+    (no-such-column (c) (is (eq :nope (error-column c)))))
+  (handler-case (find-table "zzz")
+    (no-such-table (c)
+      (is (equal "zzz" (error-table c)))
+      (is (search "zzz" (princ-to-string c))))))
+
 ;;; tables and schema
 
 (def-test column-names-become-keywords (:fixture clean-db)
@@ -39,25 +57,25 @@
 
 (def-test duplicate-table-is-an-error (:fixture clean-db)
   (make-people)
-  (signals error (make-people)))
+  (signals table-exists (make-people)))
 
 (def-test drop-table-removes-it (:fixture clean-db)
   (make-people)
   (is-true (drop-table "people"))
   (is (null (show-tables)))
-  (signals error (insert-row '(:name "x") "people")))
+  (signals no-such-table (insert-row '(:name "x") "people")))
 
 (def-test unknown-column-type-is-an-error (:fixture clean-db)
-  (signals error (make-table "t" '((:a no-such-type)))))
+  (signals schema-error (make-table "t" '((:a no-such-type)))))
 
 (def-test duplicate-column-names-are-an-error (:fixture clean-db)
-  (signals error (make-table "t" '((:a string) (:a number)))))
+  (signals schema-error (make-table "t" '((:a string) (:a number)))))
 
 (def-test two-primary-keys-are-an-error (:fixture clean-db)
-  (signals error (make-table "t" '((:a primary-key-column) (:b primary-key-column)))))
+  (signals schema-error (make-table "t" '((:a primary-key-column) (:b primary-key-column)))))
 
 (def-test foreign-key-needs-a-reference-table (:fixture clean-db)
-  (signals error (make-table "t" '((:a foreign-key-column)))))
+  (signals schema-error (make-table "t" '((:a foreign-key-column)))))
 
 (def-test prebuilt-schema-with-subclass-columns (:fixture clean-db)
   (let ((schema (make-schema '((:id primary-key-column) (:n number)))))
@@ -71,7 +89,7 @@
   (is (equal "paris" (getf (get-row 1 "people") :city)))
   (insert-row '(:name "dan" :age 1 :active nil) "people")
   (is (equal "paris" (getf (get-row 4 "people") :city)))
-  (signals error (add-column (find-table "people") '(:city string))))
+  (signals schema-error (add-column (find-table "people") '(:city string))))
 
 ;;; insert, get, update, delete
 
@@ -93,10 +111,10 @@
 
 (def-test insert-rejects-bad-input (:fixture clean-db)
   (make-people)
-  (signals error (insert-row '(:name "x") "no-such-table"))
-  (signals error (insert-row '(:nope 1) "people"))
-  (signals error (insert-row '(:name) "people"))
-  (signals error (insert-row '(:id 99 :name "x") "people")))
+  (signals no-such-table (insert-row '(:name "x") "no-such-table"))
+  (signals no-such-column (insert-row '(:nope 1) "people"))
+  (signals invalid-row (insert-row '(:name) "people"))
+  (signals invalid-row (insert-row '(:id 99 :name "x") "people")))
 
 (def-test failed-insert-does-not-use-an-id (:fixture clean-db)
   (make-people)
@@ -105,7 +123,7 @@
 
 (def-test null-in-interned-column-is-an-error (:fixture clean-db)
   (make-table "t" '((:tag interned-string)))
-  (signals error (insert-row '() "t")))
+  (signals not-null-violation (insert-row '() "t")))
 
 (def-test interned-column-shares-equal-strings (:fixture clean-db)
   (make-table "t" '((:tag interned-string)))
@@ -124,9 +142,9 @@
 (def-test update-rejects-bad-input (:fixture clean-db)
   (make-people)
   (add-people)
-  (signals error (update-row 99 '(:age 1) "people"))
-  (signals error (update-row 1 '(:nope 1) "people"))
-  (signals error (update-row 1 '(:id 5) "people")))
+  (signals no-such-row (update-row 99 '(:age 1) "people"))
+  (signals no-such-column (update-row 1 '(:nope 1) "people"))
+  (signals invalid-row (update-row 1 '(:id 5) "people")))
 
 (def-test delete-removes-a-row (:fixture clean-db)
   (make-people)
@@ -148,12 +166,12 @@
   (make-people)
   (make-pets)
   (add-people)
-  (signals error (insert-row '(:owner 99 :pet "rex") "pets"))
-  (signals error (insert-row '(:pet "rex") "pets")))
+  (signals foreign-key-violation (insert-row '(:owner 99 :pet "rex") "pets"))
+  (signals foreign-key-violation (insert-row '(:pet "rex") "pets")))
 
 (def-test foreign-key-to-a-missing-table-is-rejected (:fixture clean-db)
   (make-pets)
-  (signals error (insert-row '(:owner 1 :pet "rex") "pets")))
+  (signals foreign-key-violation (insert-row '(:owner 1 :pet "rex") "pets")))
 
 (def-test foreign-key-is-checked-on-update (:fixture clean-db)
   (make-people)
@@ -161,7 +179,7 @@
   (add-people)
   (insert-row '(:owner 1 :pet "rex") "pets")
   (finishes (update-row 1 '(:owner 2) "pets"))
-  (signals error (update-row 1 '(:owner 99) "pets")))
+  (signals foreign-key-violation (update-row 1 '(:owner 99) "pets")))
 
 ;;; select
 
@@ -212,9 +230,9 @@
 
 (def-test select-unknown-column-is-an-error (:fixture clean-db)
   (make-people)
-  (signals error (select :from "people" :col :nope))
-  (signals error (select :from "people" :order-by :nope))
-  (signals error (select :from "no-such-table")))
+  (signals no-such-column (select :from "people" :col :nope))
+  (signals no-such-column (select :from "people" :order-by :nope))
+  (signals no-such-table (select :from "no-such-table")))
 
 (def-test select-distinct (:fixture clean-db)
   (make-people)
@@ -272,7 +290,7 @@
   (make-people)
   (make-pets)
   (add-people)
-  (signals error (select :from "pets" :inner-join '("people" :owner :id))))
+  (signals query-error (select :from "pets" :inner-join '("people" :owner :id))))
 
 ;;; persistence
 
@@ -300,8 +318,8 @@
   (is (equal '(:id 1 :owner 1 :pet "rex") (get-row 1 "pets")))
   ;; the id counter continues, constraints and normalisers still work
   (is (= 4 (insert-row '(:name "dan") "people")))
-  (signals error (insert-row '(:owner 99 :pet "x") "pets"))
-  (signals error (insert-row '() "tags"))
+  (signals foreign-key-violation (insert-row '(:owner 99 :pet "x") "pets"))
+  (signals not-null-violation (insert-row '() "tags"))
   (is (= 2 (length (row-list (select :from "people" :where (matching "people" :age 30)))))))
 
 (def-test load-replaces-existing-tables (:fixture clean-db)
@@ -318,7 +336,7 @@
     (lambda (path)
       (cl-store:store '(1 2 3) path)
       (make-people)
-      (signals error (load-db path))
+      (signals file-format-error (load-db path))
       (is (equal '("people") (show-tables))))))
 
 ;;; threads
