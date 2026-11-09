@@ -47,7 +47,11 @@
   ;; the write-ahead log of an open database, else nil. See wal.lisp.
   (wal nil)
   ;; function of (seq entries) that writes a commit to the log
-  (commit-fn nil))
+  (commit-fn nil)
+  ;; function of no arguments, called after a commit is visible
+  (post-commit-fn nil)
+  ;; the snapshot file of an open database
+  (path nil))
 
 (defvar *db* (make-db))
 
@@ -117,7 +121,9 @@
         (when (db-commit-fn *db*)
           (funcall (db-commit-fn *db*) seq entries))
         (setf (db-seq *db*) seq)))
-    (setf (db-root *db*) (txn-root *txn*))))
+    (setf (db-root *db*) (txn-root *txn*))
+    (when (and entries (db-post-commit-fn *db*))
+      (funcall (db-post-commit-fn *db*)))))
 
 (defun call-with-savepoint (fn)
   (let ((saved (txn-root *txn*))
@@ -957,6 +963,9 @@
 ;; Write all committed tables to FILE. Return FILE.
 ;; Changes of an open transaction are not saved until it commits.
 (defun save-db (file)
+  (when (and (db-path *db*) (equal (native-path file) (native-path (db-path *db*))))
+    (error 'persistence-error
+           :message "That file is the snapshot of the open database. Use checkpoint instead."))
   (get-lock *file-lock*
     (multiple-value-bind (root seq) (committed-state)
       (write-snapshot file root seq))))

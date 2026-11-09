@@ -20,7 +20,7 @@
     ;; queries
     #:select #:matching
     ;; persistence
-    #:save-db #:load-db #:open-db #:close-db
+    #:save-db #:load-db #:open-db #:close-db #:checkpoint
     ;; conditions
     #:hash-db-error #:error-message #:error-table #:error-column #:error-id #:error-file
     #:no-such-table #:no-such-column #:no-such-row

@@ -12,11 +12,13 @@
 
 (in-package :hash-db)
 
-(defstruct (wal (:constructor make-wal (stream path sync bytes)))
+(defstruct (wal (:constructor make-wal (stream path sync checkpoint-bytes bytes)))
   stream
   path
   ;; :always flushes to disk at every commit. :never leaves it to the OS.
   sync
+  ;; the log is folded into the snapshot when it grows past this. Nil means never.
+  checkpoint-bytes
   ;; size of the file
   bytes
   ;; true after a failed write that could not be undone
@@ -155,6 +157,46 @@
   (open path :direction :output :element-type '(unsigned-byte 8)
              :if-exists :append :if-does-not-exist :create))
 
+;;; Checkpoint
+;;;
+;;; A checkpoint writes the committed state as a new snapshot and then empties
+;;; the log. If a crash comes between the two steps, the log still holds records
+;;; that are in the snapshot. Replay skips them by their transaction numbers.
+
+;; Caller holds the writer lock.
+(defun write-checkpoint ()
+  (let ((wal (db-wal *db*)))
+    (write-snapshot (db-path *db*) (db-root *db*) (db-seq *db*))
+    (let ((fd (sb-sys:fd-stream-fd (wal-stream wal))))
+      (handler-case
+          (progn (sb-posix:ftruncate fd 0)
+                 (file-position (wal-stream wal) 0)
+                 (sb-posix:fsync fd)
+                 (setf (wal-bytes wal) 0))
+        (error (c)
+          (setf (wal-broken wal) t)
+          (error 'persistence-error
+                 :message (format nil "The snapshot is saved, but the log could not be emptied: ~A" c)))))))
+
+;; Fold the log into the snapshot. Return the transaction number of the snapshot.
+(defun checkpoint ()
+  (when *txn*
+    (error 'transaction-error :message "Can't checkpoint inside a transaction"))
+  (with-writer
+    (unless (db-wal *db*)
+      (error 'persistence-error :message "No database is open"))
+    (write-checkpoint)
+    (db-seq *db*)))
+
+;; After a commit: checkpoint when the log is too big. The commit is already
+;; durable in the log, so a failed checkpoint is only a warning.
+(defun maybe-checkpoint (wal)
+  (let ((limit (wal-checkpoint-bytes wal)))
+    (when (and limit (>= (wal-bytes wal) limit))
+      (handler-case (write-checkpoint)
+        (error (c)
+          (warn "Automatic checkpoint failed. The log keeps growing. ~A" c))))))
+
 ;;; Open and close
 
 (defun wal-exists-p (path)
@@ -165,10 +207,13 @@
 ;; From now on every committed transaction is written to the log first.
 ;;
 ;; SYNC is :always (flush each commit to disk) or :never (leave it to the OS).
+;; CHECKPOINT-BYTES is the log size that triggers an automatic checkpoint.
+;; Nil turns automatic checkpoints off.
 ;; If tables are in memory and no files exist yet, the tables become the first
 ;; snapshot. If files exist, memory must be empty.
-(defun open-db (path &key (sync :always))
+(defun open-db (path &key (sync :always) (checkpoint-bytes (* 8 1024 1024)))
   (check-type sync (member :always :never))
+  (check-type checkpoint-bytes (or null (integer 1)))
   (when *txn*
     (error 'transaction-error :message "Can't open a database inside a transaction"))
   (with-writer
@@ -189,22 +234,29 @@
       (unless snapshot-p
         (write-snapshot path root seq))
       (let* ((stream (open-wal-stream (log-path path)))
-             (wal (make-wal stream (log-path path) sync (file-length stream))))
+             (wal (make-wal stream (log-path path) sync checkpoint-bytes (file-length stream))))
         (fsync-directory path)
         (setf (db-root *db*) root
               (db-seq *db*) seq
               (db-wal *db*) wal
-              (db-commit-fn *db*) #'(lambda (seq entries) (wal-append wal seq entries))))
+              (db-path *db*) path
+              (db-commit-fn *db*) #'(lambda (seq entries) (wal-append wal seq entries))
+              (db-post-commit-fn *db*) #'(lambda () (maybe-checkpoint wal))))
       (show-tables))))
 
-;; Stop logging. The tables stay in memory.
-(defun close-db ()
+;; Stop logging. The tables stay in memory. With CHECKPOINT true, fold the
+;; log into the snapshot first, so the next open starts fast.
+(defun close-db (&key (checkpoint t))
   (when *txn*
     (error 'transaction-error :message "Can't close a database inside a transaction"))
   (with-writer
     (let ((wal (db-wal *db*)))
       (when wal
+        (when (and checkpoint (plusp (wal-bytes wal)) (not (wal-broken wal)))
+          (write-checkpoint))
         (setf (db-wal *db*) nil
-              (db-commit-fn *db*) nil)
+              (db-path *db*) nil
+              (db-commit-fn *db*) nil
+              (db-post-commit-fn *db*) nil)
         (close (wal-stream wal))
         t))))
