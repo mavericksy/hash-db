@@ -350,9 +350,13 @@
    (unique              :reader unique-p
                         :initarg                    :unique
                         :initform nil)
-   ;; function designator called with a value. Nil result rejects the value.
+   ;; a function designator called with a value, or an expression about this column.
+   ;; A false result rejects the value.
    (check               :reader check-fn
                         :initarg                    :check
+                        :initform nil)
+   ;; the function made from an expression in CHECK
+   (check-compiled      :reader check-compiled
                         :initform nil)
    (value-normaliser    :reader value-normaliser
                         :initarg                    :value-normaliser
@@ -397,18 +401,33 @@
            :message (format nil "Column ~A can't be :not-null with :on-delete :set-null" (name col)))))
 
 ;; A constant default value must pass the same checks as any other value.
+(declaim (ftype function compile-check-expression))
+
 (defmethod initialize-instance :after ((col column) &key)
   (flet ((designator-p (x) (typep x '(or function (and symbol (not null))))))
-    (dolist (option (list (cons :default-fn (default-fn col)) (cons :check (check-fn col))))
-      (when (and (cdr option) (not (designator-p (cdr option))))
-        (error 'schema-error
-               :message (format nil "Option ~S of column ~A must be a function or a function name"
-                                (car option) (name col))))))
+    (when (and (default-fn col) (not (designator-p (default-fn col))))
+      (error 'schema-error
+             :message (format nil "Option :default-fn of column ~A must be a function or a function name"
+                              (name col))))
+    (when (check-fn col)
+      (cond ((consp (check-fn col))
+             (setf (slot-value col 'check-compiled)
+                   (compile-check-expression (check-fn col) col)))
+            ((not (designator-p (check-fn col)))
+             (error 'schema-error
+                    :message (format nil "Option :check of column ~A must be a function, a function name or an expression"
+                                     (name col)))))))
   (when (and (default-fn col) (not (null-value-p (default-value col))))
     (error 'schema-error
            :message (format nil "Column ~A has both :default and :default-fn" (name col))))
   (unless (null-value-p (default-value col))
     (normalise-for-col (default-value col) col)))
+
+;; True when VALUE passes the :check of COL, or COL has none.
+(defun check-passes-p (col value)
+  (cond ((null (check-fn col)) t)
+        ((check-compiled col) (funcall (check-compiled col) value))
+        (t (funcall (check-fn col) value))))
 
 ;; The value for a column that a new row does not give.
 (defun column-default (col)
@@ -817,7 +836,7 @@
 (defun resolve-column-value (col val)
   (let ((normalised (normalise-for-col val col)))
     (unless (null-value-p normalised)
-      (when (and (check-fn col) (not (funcall (check-fn col) normalised)))
+      (when (and (check-fn col) (not (check-passes-p col normalised)))
         (error 'check-violation :column (name col)
                :message (format nil "Check failed for column ~A: value ~S" (name col) normalised)))
       (when (typep col 'foreign-key-column)

@@ -40,11 +40,11 @@ A column is `(name type :option value ...)`. Column names are keywords. A symbol
 | `:default-fn fn` | function called for each new row that does not give a value |
 | `:not-null t` | reject NULL |
 | `:unique t` | reject a second row with the same non-null value |
-| `:check fn` | reject a value when `fn` returns nil. `fn` does not run on NULL |
+| `:check c` | reject a value when the check is false. `c` is a function, a function name, or an expression about this column such as `(and (>= :age 0) (< :age 150))`. It does not run on NULL |
 | `:references "table"` | foreign key only. The table that holds the referenced rows |
 | `:on-delete action` | foreign key only. `:restrict` (default), `:cascade` or `:set-null` |
 
-`:default-fn` and `:check` take a function or a function name. `save-db` can only save a function name. It signals `schema-error` for a function object such as a `lambda`.
+`:default-fn` and `:check` take a function or a function name. `:check` also takes an expression. `save-db` can only save a function name or an expression. It signals `persistence-error` for a function object such as a `lambda`.
 
 ```lisp
 (make-table "people" '((:id primary-key-column)

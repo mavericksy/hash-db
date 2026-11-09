@@ -142,6 +142,14 @@
 (defmacro call-all (fns row)
   `(mapcar #'(lambda (f) (funcall f ,row)) ,fns))
 
+;; A :check of a column can be an expression about that column, such as (> :age 0).
+;; Return a function of the value. It is true when the expression is true.
+(defun compile-check-expression (expr col)
+  (let ((f (compile-expr expr (make-ectx (list col))))
+        (name (name col)))
+    #'(lambda (value)
+        (eq t (truth (funcall f (list name value)))))))
+
 ;; Compile a :where. It can be a function of one row, the name of such a
 ;; function, or an expression. Return a function of one row that is true when
 ;; the row passes, or nil when there is no condition.
