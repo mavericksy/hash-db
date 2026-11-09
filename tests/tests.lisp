@@ -1373,3 +1373,72 @@
       (open-db path)
       (signals persistence-error (save-db path))
       (finishes (save-db (merge-pathnames "copy.db" dir))))))
+
+;;; crash recovery
+;;;
+;;; A child process adds rows and prints the number of each commit. The test kills
+;;; it with SIGKILL at a random moment, opens the database, and checks the rules:
+;;; every commit the child reported is there, no commit is half there, and the
+;;; database opens without error. It repeats this on the same files, with a small
+;;; log limit so that some kills land inside a checkpoint.
+
+;; The path is read when this file is compiled, because a compiled file loads
+;; from the ASDF cache, not from the source directory.
+(defparameter *crash-child*
+  (merge-pathnames "crash-child.lisp"
+                   (uiop:pathname-directory-pathname
+                    #.(or *compile-file-truename* *load-truename*))))
+
+;; Run the child until it reports KILL-AFTER commits, then kill it.
+;; Return the highest commit number it reported.
+(defun run-crash-child (path checkpoint-bytes kill-after)
+  (let* ((process (uiop:launch-program
+                   (list "sbcl" "--noinform" "--non-interactive"
+                         "--eval" (format nil "(defparameter cl-user::*db-path* ~S)"
+                                          (uiop:native-namestring path))
+                         "--eval" (format nil "(defparameter cl-user::*checkpoint-bytes* ~D)"
+                                          checkpoint-bytes)
+                         "--load" (uiop:native-namestring *crash-child*))
+                   :output :stream :error-output nil))
+         (out (uiop:process-info-output process))
+         (reported 0))
+    (flet ((note (line)
+             (let ((n (parse-integer line :junk-allowed t)))
+               (when n (setf reported (max reported n))))))
+      (loop for line = (read-line out nil)
+            while line
+            do (note line)
+               (when (>= reported kill-after) (return)))
+      (uiop:terminate-process process :urgent t)
+      (loop for line = (read-line out nil) while line do (note line))
+      (uiop:wait-process process))
+    reported))
+
+;; Open the database after a crash. Return the number of rows in table "a".
+;; Check that "a" and "b" hold the same rows, which means no commit is half there.
+(defun check-after-crash (path reported)
+  (setf hash-db::*db* (hash-db::make-db))
+  (call-catching-truncation (lambda () (open-db path)))
+  (let ((a (row-list "a"))
+        (b (row-list "b")))
+    (is (equal a b) "tables a and b hold the same rows")
+    (is (<= reported (length a) (1+ reported))
+        "every reported commit is there, and at most one unreported commit")
+    (is (loop for row in a
+              for i from 1
+              always (and (= i (getf row :id) (getf row :n))
+                          (equal (format nil "row ~D" i) (getf row :s))))
+        "rows are 1, 2, 3 ... in order and whole")
+    (close-db :checkpoint nil)
+    (length a)))
+
+(def-test killed-process-loses-no-reported-commit (:fixture clean-db)
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "crash.db" dir))
+          (random-state (make-random-state t))
+          (rows 0))
+      (dotimes (round 6)
+        (let* ((kill-after (+ rows 1 (random 60 random-state)))
+               (reported (run-crash-child path 2500 kill-after)))
+          (is (>= reported kill-after) "the child ran until it was killed")
+          (setf rows (check-after-crash path reported)))))))
