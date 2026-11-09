@@ -75,5 +75,9 @@
 (define-condition json-error (hash-db-error) ()
   (:documentation "Text is not JSON, or data can't be written as JSON."))
 
+(define-condition import-error (hash-db-error)
+  ((line :initarg :line :reader error-line :initform nil))
+  (:documentation "A file of rows can't be read into a table. LINE is the line or row number."))
+
 (define-condition file-format-error (hash-db-error)
   ((file :initarg :file :reader error-file)))
