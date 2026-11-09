@@ -50,6 +50,8 @@
   (commit-fn nil)
   ;; function of no arguments, called after a commit is visible
   (post-commit-fn nil)
+  ;; the background thread that removes expired rows, or nil. See ttl.lisp.
+  (sweeper nil)
   ;; the snapshot file of an open database
   (path nil))
 
@@ -172,6 +174,10 @@
    ;; list of TRIGGER structures. See the section on triggers.
    (triggers      :reader triggers
                   :initarg         :triggers
+                  :initform        nil)
+   ;; the column that holds when a row expires, or nil. See ttl.lisp.
+   (ttl           :reader ttl
+                  :initarg         :ttl
                   :initform        nil))
   (:documentation "A table in a database."))
 
@@ -182,9 +188,9 @@
   (ensure-implicit-indexes (make-instance 'table :name name :schema schema)))
 
 (defun updated-table (tbl &key (rows (rows tbl)) (pk (pk tbl)) (schema (schema tbl))
-                            (indexes (indexes tbl)) (triggers (triggers tbl)))
+                            (indexes (indexes tbl)) (triggers (triggers tbl)) (ttl (ttl tbl)))
   (make-instance 'table :name (name tbl) :rows rows :pk pk :schema schema :indexes indexes
-                        :triggers triggers))
+                        :triggers triggers :ttl ttl))
 
 ;; Store or remove any named thing in the working root. Only inside WITH-TRANSACTION.
 (defun put-object (name object)
@@ -1041,16 +1047,18 @@
                 collect (list (index-name ix) (index-column ix) (and (index-unique ix) t)))
         (loop for trigger in (triggers tbl)
               collect (list (trigger-name trigger) (trigger-timing trigger)
-                            (trigger-events trigger) (trigger-function trigger)))))
+                            (trigger-events trigger) (trigger-function trigger)))
+        (ttl tbl)))
 
 (defun restore-table (snapshot)
-  (destructuring-bind (name pk col-specs id-rows &optional index-specs trigger-specs) snapshot
+  (destructuring-bind (name pk col-specs id-rows &optional index-specs trigger-specs ttl) snapshot
     (let ((tbl (ensure-implicit-indexes
                 (make-instance 'table :name name :pk pk
                                       :schema (make-schema col-specs)
                                       :rows (fset:convert 'fset:map id-rows)
                                       :triggers (mapcar #'(lambda (spec) (apply #'make-trigger spec))
-                                                        trigger-specs)))))
+                                                        trigger-specs)
+                                      :ttl ttl))))
       (dolist (spec index-specs tbl)
         (destructuring-bind (index-name column unique) spec
           (setf tbl (updated-table tbl :indexes (append (indexes tbl)

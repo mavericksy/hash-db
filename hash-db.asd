@@ -21,6 +21,7 @@
                (:file "query")
                (:file "views")
                (:file "triggers")
+               (:file "ttl")
                ;; the write-ahead log needs SBCL: sb-posix and sb-ext
                (:file "wal" :if-feature :sbcl))
   :in-order-to ((test-op (test-op #:hash-db/tests))))
@@ -35,7 +36,8 @@
                              (:file "query-tests")
                              (:file "index-tests")
                              (:file "extension-tests")
-                             (:file "trigger-tests"))))
+                             (:file "trigger-tests")
+                             (:file "ttl-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))

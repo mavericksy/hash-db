@@ -15,6 +15,9 @@
     #:timestamp #:any
     ;; transactions
     #:with-transaction #:rollback #:with-snapshot
+    ;; expiry
+    #:set-ttl #:clear-ttl #:ttl-column #:purge-expired #:expires-in #:now #:*clock*
+    #:start-sweeper #:stop-sweeper
     ;; triggers
     #:create-trigger #:drop-trigger #:show-triggers
     ;; views
