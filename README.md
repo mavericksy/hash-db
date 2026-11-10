@@ -435,6 +435,53 @@ Every commit that changes data makes a new version. An old version stays whole, 
 
 History is off by default and kept in memory only. Kept versions hold the memory of rows that later changes replaced. It starts again after a restart.
 
+## SQL
+
+`sql` runs one statement of SQL. It reads the text, looks up the names in your tables, and calls `select`, `update-where`, `create-index` and the rest. So everything above holds for it: transactions, indexes, triggers, the log.
+
+```lisp
+(sql "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT)")
+(sql "INSERT INTO customers (name, city) VALUES (?, ?)" "ann" "oslo")   ; => 1, 1  (rows, last id)
+(sql-rows "SELECT name FROM customers WHERE city = ? ORDER BY name LIMIT 10" "oslo")
+;; => ((:NAME "ann"))
+(sql "UPDATE customers SET city = upper(city) WHERE name = 'ann'")      ; => rows changed
+(sql "DELETE FROM customers WHERE city IS NULL")                         ; => rows deleted
+(sql "EXPLAIN SELECT * FROM customers WHERE name = 'ann'")               ; the steps, as explain gives them
+```
+
+- `sql` gives a table for `SELECT`. `sql-rows` gives the rows as plists. `INSERT` gives the row count and the last id. `UPDATE` and `DELETE` give the row count.
+- A `?` takes the next value after the text. A value is data and never SQL, so there is no injection. Pass `:null` for NULL. A wrong number of values is an error.
+- `sql-script` runs several statements, separated by semicolons, as one transaction. The `?` of all of them take the values in order. It gives a list of the results. A script can make a table and then fill it.
+- `(sql-expression "age >= ? AND name LIKE 'a%'" "people" 18)` gives an expression for `:where` and the like, so you can mix SQL and the other forms.
+
+**What it reads**
+
+| Statement | Notes |
+|-----------|-------|
+| `SELECT` | `DISTINCT`, `*` and `t.*`, `expr AS alias`, `FROM table [alias]`, `[INNER\|LEFT\|RIGHT\|FULL [OUTER]] JOIN t [alias] ON a = b` in a chain, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`, `OFFSET` |
+| `INSERT` | `INSERT INTO t [(cols)] VALUES (...), (...)` and `INSERT INTO t [(cols)] SELECT ...`. `DEFAULT` leaves a column out |
+| `UPDATE`, `DELETE` | with or without `WHERE`. Without it they change every row |
+| `CREATE TABLE` | types `INTEGER`, `REAL`/`FLOAT`, `NUMERIC`, `TEXT`/`VARCHAR`, `BOOLEAN`, `TIMESTAMP`, `JSON`. `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `REFERENCES t(id) [ON DELETE CASCADE\|SET NULL\|RESTRICT]`, as column or table constraints. `IF NOT EXISTS` |
+| `CREATE INDEX [UNIQUE]`, `CREATE VIEW`, `CREATE SEQUENCE` | `CREATE INDEX [name] ON t (col)`, `CREATE VIEW v AS SELECT ...`, `CREATE SEQUENCE s [START [WITH] n] [INCREMENT [BY] n]` |
+| `DROP TABLE`, `VIEW`, `INDEX`, `SEQUENCE` | with `IF EXISTS`. `DROP INDEX name [ON table]` |
+| `ALTER TABLE` | `ADD [COLUMN] def`, `DROP [COLUMN] c`, `RENAME [COLUMN] a TO b`, `RENAME TO t` |
+| `EXPLAIN SELECT` | |
+
+Expressions: `OR AND NOT`, `= <> != < > <= >=`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] BETWEEN`, `[NOT] LIKE`, `+ - * /`, `||`, and the functions `LOWER`, `UPPER`, `LENGTH`, `COALESCE`, `COUNT` (also `COUNT(*)` and `COUNT(DISTINCT x)`), `SUM`, `AVG`, `MIN`, `MAX`, `JSON_GET`, `NOW()`, `CURRENT_TIMESTAMP`, `NEXTVAL('s')` and `CURRVAL('s')`.
+
+**Names and types**
+
+- Names are not case sensitive. A table name that is not `"quoted"` is read in lower case. It also finds a table that has capitals if no other table matches. Quote a name to match it exactly.
+- A column name in SQL has no hyphen, so `pet_ref` also finds the column `PET-REF`. An exact match comes first.
+- Each joined table is joined with its alias, or its name, as the prefix. `SELECT *` and `t.*` give plain column names. When two items would have the same name, they are named `table.column`.
+- `id INTEGER PRIMARY KEY` is a generated key. Leave it out of `INSERT`.
+- `TIMESTAMP` holds a universal time, a whole number, not a date text. `TEXT` is a string.
+- A `CHECK` is kept as an expression, so it survives a save and a restart. It can name one column.
+
+**Not supported.** Each gives a `sql-error` that says so: subqueries, `UNION` and its kin, `CASE`, `SELECT` without `FROM`, a list of tables (`FROM a, b`), `CROSS` and `NATURAL JOIN`, `USING`, an `ON` that is not one equality, `ORDER BY` a column number, `%`, keys and unique constraints of several columns, named constraints, `ON UPDATE`, `ADD CONSTRAINT`, and types such as `DATE` and `BLOB`.
+
+A `sql-error` tells the line and column, and shows the text near it. `error-position` and `error-sql` give the details.
+
 ## Errors
 
 Every error that hash-db signals is a `hash-db-error`.
@@ -447,6 +494,7 @@ hash-db-error
   invalid-row
   query-error
   file-format-error
+  sql-error
   persistence-error
   transaction-error
   trigger-error
