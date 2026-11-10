@@ -124,3 +124,10 @@
     (insert-row '(:name "zed" :age 1) "people")
     (is (= 6 (length (q "SELECT * FROM people")))))
   (is (equal '() (let ((hash-db::*as-of* nil)) (q "SELECT name FROM people WHERE name = 'nobody'")))))
+
+(def-test sql-false-condition-keeps-no-rows (:fixture clean-db)
+  (make-sample-people)
+  (is (null (q "SELECT name FROM people WHERE FALSE")))
+  (is (null (q "SELECT name FROM people WHERE ?" nil)))
+  (is (= 5 (length (q "SELECT name FROM people WHERE TRUE"))))
+  (is (null (q "SELECT count(*) AS n FROM people GROUP BY name HAVING FALSE"))))

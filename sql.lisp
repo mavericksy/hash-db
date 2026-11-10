@@ -48,6 +48,17 @@
           (duplicated (list (dsl-op "AS") ref (prefixed-name (scope-entry-qualifier entry) (name column))))
           (t (list (dsl-op "AS") ref (name column))))))
 
+;; A table reference of a FROM or a JOIN. Return what select takes for it (a table name, or
+;; the table of a query in brackets), the table, and the name a query uses for it.
+(defun resolve-table-reference (reference)
+  (if (eq (first reference) :derived)
+      (destructuring-bind (query alias) (rest reference)
+        (let ((table (run-subquery query)))
+          (values table table alias)))
+      (destructuring-bind (text quoted alias) reference
+        (let ((table-name (sql-table-name text quoted)))
+          (values table-name (find-table table-name) (or alias text))))))
+
 (defun scope-entries-for (qualifier)
   (if qualifier
       (let ((entry (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)))
@@ -145,25 +156,26 @@
 (defun translate-joins (join-trees)
   (let ((joins '()))
     (dolist (join join-trees)
-      (destructuring-bind (kind (text quoted alias) on) join
-        (let* ((table-name (sql-table-name text quoted))
-               (table (find-table table-name))
-               (qualifier (or alias text))
-               (entry (make-scope-entry qualifier table-name (schema table) qualifier)))
-          (when (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)
-            (sql-fail *sql-text* nil "Two tables are called ~A. Give one an alias" qualifier))
-          (multiple-value-bind (here there) (resolve-join-condition on entry)
-            (push (list kind table-name here there :as qualifier) joins))
-          (setf *scope* (append *scope* (list entry))))))
+      (destructuring-bind (kind reference on) join
+        (multiple-value-bind (table-name table qualifier) (resolve-table-reference reference)
+          (let ((entry (make-scope-entry qualifier table-name (schema table) qualifier)))
+            (when (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)
+              (sql-fail *sql-text* nil "Two tables are called ~A. Give one an alias" qualifier))
+            (multiple-value-bind (here there) (resolve-join-condition on entry)
+              (push (list kind table-name here there :as qualifier) joins))
+            (setf *scope* (append *scope* (list entry)))))))
     (nreverse joins)))
 
 ;; The arguments of select for a SELECT tree.
+;; A :where or :having of nil means no condition, but a condition that is the constant
+;; false must keep every row out.
+(defun condition-argument (expr)
+  (if (null expr) (list (dsl-op "QUOTE") nil) expr))
+
 (defun translate-select (ast)
   (destructuring-bind (&key distinct items from joins where group having order limit offset) (rest ast)
-    (destructuring-bind (table-text quoted alias) from
-      (let* ((table-name (sql-table-name table-text quoted))
-             (table (find-table table-name))
-             (*scope* (list (make-scope-entry (or alias table-text) table-name (schema table) nil)))
+    (multiple-value-bind (table-name table qualifier) (resolve-table-reference from)
+      (let* ((*scope* (list (make-scope-entry qualifier table-name (schema table) nil)))
              (*aliases* nil)
              (plist (list :from table-name))
              (join-args (translate-joins joins)))
@@ -171,10 +183,10 @@
         (multiple-value-bind (col aliases) (translate-select-items items)
           (setf (getf plist :col) col)
           (when distinct (setf (getf plist :distinct) t))
-          (when where (setf (getf plist :where) (translate-expression where)))
+          (when where (setf (getf plist :where) (condition-argument (translate-expression where))))
           (when group (setf (getf plist :group-by) (mapcar #'translate-expression group)))
           (let ((*aliases* aliases))
-            (when having (setf (getf plist :having) (translate-expression having)))
+            (when having (setf (getf plist :having) (condition-argument (translate-expression having))))
             (when order (setf (getf plist :order-by) (mapcar #'translate-order-key order))))
           (when limit (setf (getf plist :limit) (translate-count limit "LIMIT")))
           (when offset (setf (getf plist :offset) (translate-count offset "OFFSET")))
@@ -217,7 +229,7 @@
                  (setf last-id (insert-row pairs table-name))
                  (incf count)))
           (if select
-              (let ((result (apply #'select (translate-select select))))
+              (let ((result (run-query select)))
                 (unless (= (length (schema result)) (length columns))
                   (sql-fail *sql-text* nil "The INSERT names ~D column~:P but the SELECT gives ~D"
                             (length columns) (length (schema result))))
@@ -432,7 +444,8 @@
     (let ((view-name (sql-new-name name quoted)))
       (if (and if-not-exists (nth-value 1 (fset:lookup (current-root) view-name)))
           nil
-          (apply #'create-view view-name (translate-select select))))))
+          (let ((*subqueries-allowed* nil))
+            (apply #'create-view view-name (translate-select select)))))))
 
 (defun execute-create-sequence (ast)
   (destructuring-bind (name quoted if-not-exists start increment) (rest ast)
@@ -498,9 +511,24 @@
         (:rename-table
          (rename-table table-name (sql-new-name (second action) nil)))))))
 
+;; Run a query and give its table.
+(defun run-query (ast)
+  (ecase (first ast)
+    (:select (apply #'select (translate-select ast)))))
+
+;; Run a subquery. It is worked out once, now, and does not see the tables of the query
+;; around it, so it can not be correlated with it.
+(defun run-subquery (query)
+  (unless *subqueries-allowed*
+    (sql-fail *sql-text* nil "A view can't have a subquery, because the view keeps the query and not its answer"))
+  (let ((*outer-scope* (append *scope* *outer-scope*))
+        (*scope* nil)
+        (*aliases* nil))
+    (run-query query)))
+
 (defun execute-statement (ast)
   (ecase (first ast)
-    (:select (apply #'select (translate-select ast)))
+    (:select (run-query ast))
     (:insert (execute-insert ast))
     (:update (execute-update ast))
     (:delete (execute-delete ast))

@@ -134,12 +134,12 @@
          (cond
            ((accept-word "IN")
             (expect-symbol "(")
-            (when (at-word "SELECT")
-              (parse-fail "Subqueries are not supported"))
-            (let ((items (list (parse-expression))))
-              (loop while (accept-symbol ",") do (push (parse-expression) items))
-              (expect-symbol ")")
-              (list :in left (nreverse items) negated)))
+            (if (at-word "SELECT")
+                (prog1 (list :in-subquery left (parse-query) negated) (expect-symbol ")"))
+                (let ((items (list (parse-expression))))
+                  (loop while (accept-symbol ",") do (push (parse-expression) items))
+                  (expect-symbol ")")
+                  (list :in left (nreverse items) negated))))
            ((accept-word "BETWEEN")
             (let ((low (parse-additive)))
               (expect-word "AND")
@@ -196,9 +196,9 @@
       (:param (advance) (list :param (prog1 *param-count* (incf *param-count*))))
       (:symbol
        (cond ((accept-symbol "(")
-              (when (at-word "SELECT")
-                (parse-fail "Subqueries are not supported"))
-              (prog1 (parse-expression) (expect-symbol ")")))
+              (if (at-word "SELECT")
+                  (prog1 (list :subquery (parse-query)) (expect-symbol ")"))
+                  (prog1 (parse-expression) (expect-symbol ")"))))
              (t (parse-fail "Expected an expression"))))
       (:word
        (cond ((token-quoted token) (parse-column-reference))
@@ -206,6 +206,12 @@
              ((at-word "TRUE") (advance) (list :lit t))
              ((at-word "FALSE") (advance) (list :lit nil))
              ((at-word "CASE") (parse-case))
+             ((and (at-word "EXISTS") (at-symbol "(" 1))
+              (advance)
+              (advance)
+              (unless (at-word "SELECT")
+                (parse-fail "Expected SELECT after EXISTS ("))
+              (prog1 (list :exists (parse-query)) (expect-symbol ")")))
              ((at-word "CURRENT_TIMESTAMP") (advance) (list :call "NOW" nil nil nil))
              ((at-word "CURRENT_DATE") (advance) (list :call "TODAY" nil nil nil))
              ;; DATE '2024-01-31' and TIMESTAMP '2024-01-31 12:00:00'
@@ -301,14 +307,26 @@
     (loop while (accept-symbol ",") do (push (funcall parser) items))
     (nreverse items)))
 
-(defun parse-table-reference ()
-  "A table name and its alias. Return (name quoted alias)."
-  (multiple-value-bind (name quoted) (parse-name "a table name")
-    (let ((alias (cond ((accept-word "AS") (parse-name "an alias after AS"))
-                       ((and (eq (token-type (tok)) :word)
-                             (or (token-quoted (tok)) (not (reserved-token-p (tok)))))
-                        (parse-name "an alias")))))
-      (list name quoted alias))))
+(defun parse-alias ()
+  (cond ((accept-word "AS") (parse-name "an alias after AS"))
+        ((and (eq (token-type (tok)) :word)
+              (or (token-quoted (tok)) (not (reserved-token-p (tok)))))
+         (parse-name "an alias"))))
+
+;; A table name and its alias, as (name quoted alias). In a FROM or a JOIN it can also be
+;; a query in brackets with an alias, as (:derived query alias).
+(defun parse-table-reference (&optional derived-ok)
+  (if (and derived-ok (at-symbol "(") (at-word "SELECT" 1))
+      (progn
+        (advance)
+        (let ((query (parse-query)))
+          (expect-symbol ")")
+          (let ((alias (parse-alias)))
+            (unless alias
+              (parse-fail "A query in FROM needs an alias"))
+            (list :derived query alias))))
+      (multiple-value-bind (name quoted) (parse-name "a table name")
+        (list name quoted (parse-alias)))))
 
 ;; A join is (kind table-reference condition) with kind :inner, :left, :right or :full.
 ;; Return nil when the next words are not a join.
@@ -323,12 +341,16 @@
                     (t nil))))
     (when kind
       (expect-word "JOIN")
-      (let ((table (parse-table-reference)))
+      (let ((table (parse-table-reference t)))
         (when (at-word "USING")
           (parse-fail "USING is not supported. Use ON a.x = b.x"))
         (unless (accept-word "ON")
           (parse-fail "Expected ON. A join needs a condition"))
         (list kind table (parse-expression))))))
+
+;; A query: for now one SELECT. Set operations come next.
+(defun parse-query ()
+  (parse-select))
 
 (defun parse-select ()
   (expect-word "SELECT")
@@ -339,7 +361,7 @@
          from joins where group having order limit offset)
     (unless (accept-word "FROM")
       (parse-fail "Expected FROM. A SELECT without a table is not supported"))
-    (setf from (parse-table-reference))
+    (setf from (parse-table-reference t))
     (loop for join = (parse-join) while join do (push join joins))
     (setf joins (nreverse joins))
     (when (accept-symbol ",")

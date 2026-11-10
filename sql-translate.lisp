@@ -16,6 +16,16 @@
 
 (defvar *scope* nil)
 
+;; The scope of the query that holds a subquery. A subquery cannot use it, but it is
+;; kept to say why a name was not found.
+(defvar *outer-scope* nil)
+
+(declaim (ftype function run-subquery))
+
+;; True while a view is being made. A view keeps its query, so it can have no subquery,
+;; whose answer would be kept as a constant.
+(defvar *subqueries-allowed* t)
+
 ;; The values of the ? parameters, as a vector.
 (defvar *params* #())
 
@@ -57,10 +67,15 @@
   (multiple-value-bind (entry column) (find-scope-column *scope* qualifier name)
     (cond (entry (values entry column))
           ((and qualifier (not (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)))
-           (sql-fail *sql-text* nil "Unknown table or alias ~A" qualifier))
+           (if (find qualifier *outer-scope* :key #'scope-entry-qualifier :test #'string-equal)
+               (sql-fail *sql-text* nil "~A.~A belongs to the query around this subquery. A subquery cannot use it"
+                         qualifier name)
+               (sql-fail *sql-text* nil "Unknown table or alias ~A" qualifier)))
           (qualifier (sql-fail *sql-text* nil "Table ~A has no column ~A" qualifier name))
           ((eq column :ambiguous)
            (sql-fail *sql-text* nil "Column ~A is in more than one table. Write table.~A" name name))
+          ((find-scope-column *outer-scope* qualifier name)
+           (sql-fail *sql-text* nil "Column ~A belongs to the query around this subquery. A subquery cannot use it" name))
           (t (sql-fail *sql-text* nil "Unknown column ~A" name)))))
 
 ;; The keyword that names a column in the rows, for a (:col qualifier name) in the scope.
@@ -183,6 +198,31 @@
      (destructuring-bind (x pattern negated) (rest ast)
        (let ((form (list (dsl-op "LIKE") (translate-expression x) (translate-expression pattern))))
          (if negated (list (dsl-op "NOT") form) form))))
+    (:subquery
+     (let ((table (run-subquery (second ast))))
+       (unless (= 1 (length (schema table)))
+         (sql-fail *sql-text* nil "A subquery used as a value must give one column, and this gives ~D"
+                   (length (schema table))))
+       (let ((rows (row-list table)))
+         (when (rest rows)
+           (sql-fail *sql-text* nil "A subquery used as a value gave more than one row"))
+         (if rows
+             (param-datum (getf (first rows) (name (first (schema table)))))
+             :null))))
+    (:in-subquery
+     (destructuring-bind (x query negated) (rest ast)
+       (let* ((table (run-subquery query))
+              (key (progn (unless (= 1 (length (schema table)))
+                            (sql-fail *sql-text* nil "A subquery after IN must give one column, and this gives ~D"
+                                      (length (schema table))))
+                          (name (first (schema table)))))
+              (values (mapcar #'(lambda (row) (param-datum (getf row key))) (row-list table)))
+              (x (translate-expression x)))
+         (cond ((null values) (if negated t nil))
+               (negated (list (dsl-op "NOT") (list* (dsl-op "IN") x values)))
+               (t (list* (dsl-op "IN") x values))))))
+    (:exists
+     (and (row-list (run-subquery (second ast))) t))
     (:case
      (destructuring-bind (operand whens else) (rest ast)
        (let ((operand (and operand (translate-expression operand))))

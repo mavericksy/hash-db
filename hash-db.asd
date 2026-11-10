@@ -60,7 +60,8 @@
                              (:file "sql-script-tests")
                              (:file "case-tests")
                              (:file "date-tests")
-                             (:file "sql-date-tests"))))
+                             (:file "sql-date-tests")
+                             (:file "sql-subquery-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))
