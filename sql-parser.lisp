@@ -567,6 +567,10 @@
 
 (defun parse-statement ()
   (cond ((at-word "SELECT") (parse-select))
+        ((accept-word "EXPLAIN")
+         (unless (at-word "SELECT")
+           (parse-fail "EXPLAIN works for SELECT only"))
+         (list :explain (parse-select)))
         ((at-word "INSERT") (parse-insert))
         ((at-word "UPDATE") (parse-update))
         ((at-word "DELETE") (parse-delete))

@@ -509,9 +509,11 @@
     (:create-view (execute-create-view ast))
     (:create-sequence (execute-create-sequence ast))
     (:drop (execute-drop ast))
-    (:alter-table (execute-alter-table ast))))
+    (:alter-table (execute-alter-table ast))
+    (:explain (apply #'explain (translate-select (second ast))))))
 
-;; Run one statement of SQL and return its result. The ? in it take the values after TEXT.
+;; EXPLAIN SELECT ... gives the steps of the query, as explain does. Run one statement of SQL and
+;; return its result. The ? in it take the values after TEXT.
 ;; A SELECT gives a table, so use row-list or sql-rows to read it. INSERT gives the number of
 ;; rows added and the id of the last one. UPDATE and DELETE give the number of rows changed.
 (defun sql (text &rest params)
@@ -526,3 +528,14 @@
 ;; Run a SELECT and return its rows as a list of plists.
 (defun sql-rows (text &rest params)
   (row-list (apply #'sql text params)))
+
+;; Run several statements, separated by semicolons, as one transaction: all of them
+;; happen, or none. The ? of all the statements take the values in order. Return the
+;; list of their results. Each statement is read when its turn comes, so a script
+;; can make a table and then fill it.
+(defun sql-script (text &rest params)
+  (multiple-value-bind (statements count) (sql-parse text)
+    (let ((*sql-text* text))
+      (with-sql-params (params count)
+        (with-transaction
+          (mapcar #'execute-statement statements))))))
