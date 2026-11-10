@@ -182,12 +182,90 @@
 
 ;;; Running
 
+;;; INSERT, UPDATE and DELETE
+
+;; The value of an expression that names no column, such as 1 + 2 or ?.
+(defun constant-sql-value (tree)
+  (let ((*scope* nil)
+        (*aliases* nil))
+    (materialize (funcall (compile-expr (translate-expression tree) (make-ectx nil)) nil))))
+
+;; The column that a name means in TBL.
+(defun table-column (tbl name)
+  (or (sql-find-column name (schema tbl))
+      (sql-fail *sql-text* nil "Table ~A has no column ~A" (name tbl) name)))
+
+(defun insert-columns (tbl names)
+  (let ((columns (if names
+                     (mapcar #'(lambda (name) (table-column tbl name)) names)
+                     (remove-if #'(lambda (col) (typep col 'primary-key-column)) (schema tbl)))))
+    (let ((keys (mapcar #'name columns)))
+      (unless (= (length keys) (length (remove-duplicates keys)))
+        (sql-fail *sql-text* nil "A column is named twice in the INSERT")))
+    columns))
+
+(defun execute-insert (ast)
+  (destructuring-bind (table-reference names rows select) (rest ast)
+    (destructuring-bind (table-text quoted alias) table-reference
+      (declare (ignore alias))
+      (let* ((table-name (sql-table-name table-text quoted))
+             (tbl (stored-table table-name))
+             (columns (insert-columns tbl names))
+             (count 0)
+             (last-id nil))
+        (flet ((add (pairs)
+                 (setf last-id (insert-row pairs table-name))
+                 (incf count)))
+          (if select
+              (let ((result (apply #'select (translate-select select))))
+                (unless (= (length (schema result)) (length columns))
+                  (sql-fail *sql-text* nil "The INSERT names ~D column~:P but the SELECT gives ~D"
+                            (length columns) (length (schema result))))
+                (dolist (row (row-list result))
+                  (add (loop for column in columns
+                             for source in (schema result)
+                             append (list (name column) (getf row (name source)))))))
+              (dolist (row rows)
+                (unless (= (length row) (length columns))
+                  (sql-fail *sql-text* nil "A row has ~D value~:P but the INSERT names ~D column~:P"
+                            (length row) (length columns)))
+                (add (loop for column in columns
+                           for tree in row
+                           unless (eq (first tree) :default)
+                             append (list (name column) (constant-sql-value tree)))))))
+        (values count last-id)))))
+
+(defun execute-update (ast)
+  (destructuring-bind (table-reference assignments where) (rest ast)
+    (destructuring-bind (table-text quoted alias) table-reference
+      (let* ((table-name (sql-table-name table-text quoted))
+             (tbl (stored-table table-name))
+             (*scope* (list (make-scope-entry (or alias table-text) table-name (schema tbl) nil)))
+             (*aliases* nil)
+             (compute (loop for (column tree) in assignments
+                            append (list (name (table-column tbl column)) (translate-expression tree)))))
+        (update-where table-name nil :compute compute
+                                     :where (if where (translate-expression where) t))))))
+
+(defun execute-delete (ast)
+  (destructuring-bind (table-reference where) (rest ast)
+    (destructuring-bind (table-text quoted alias) table-reference
+      (let* ((table-name (sql-table-name table-text quoted))
+             (tbl (stored-table table-name))
+             (*scope* (list (make-scope-entry (or alias table-text) table-name (schema tbl) nil)))
+             (*aliases* nil))
+        (delete-where table-name :where (if where (translate-expression where) t))))))
+
 (defun execute-statement (ast)
   (ecase (first ast)
-    (:select (apply #'select (translate-select ast)))))
+    (:select (apply #'select (translate-select ast)))
+    (:insert (execute-insert ast))
+    (:update (execute-update ast))
+    (:delete (execute-delete ast))))
 
 ;; Run one statement of SQL and return its result. The ? in it take the values after TEXT.
-;; A SELECT gives a table, so use row-list or sql-rows to read it.
+;; A SELECT gives a table, so use row-list or sql-rows to read it. INSERT gives the number of
+;; rows added and the id of the last one. UPDATE and DELETE give the number of rows changed.
 (defun sql (text &rest params)
   (multiple-value-bind (statements count) (sql-parse text)
     (when (rest statements)

@@ -344,6 +344,54 @@
         (parse-fail "There is no statement"))
       (values (nreverse statements) *param-count*))))
 
+;; INSERT gives (:insert table-reference columns rows select). COLUMNS is a list of names
+;; or nil. ROWS is a list of rows of expressions, in which (:default) means the default.
+;; SELECT is a SELECT tree instead of ROWS.
+(defun parse-insert ()
+  (expect-word "INSERT")
+  (expect-word "INTO")
+  (let ((table (parse-table-reference))
+        (columns nil))
+    (when (accept-symbol "(")
+      (setf columns (parse-comma-list #'(lambda () (parse-name "a column name"))))
+      (expect-symbol ")"))
+    (cond ((accept-word "VALUES")
+           (list :insert table columns
+                 (parse-comma-list
+                  #'(lambda ()
+                      (expect-symbol "(")
+                      (prog1 (parse-comma-list
+                              #'(lambda ()
+                                  (if (and (at-word "DEFAULT") (or (at-symbol "," 1) (at-symbol ")" 1)))
+                                      (progn (advance) (list :default))
+                                      (parse-expression))))
+                        (expect-symbol ")"))))
+                 nil))
+          ((at-word "SELECT") (list :insert table columns nil (parse-select)))
+          (t (parse-fail "Expected VALUES or SELECT")))))
+
+;; UPDATE gives (:update table-reference ((column tree) ...) where).
+(defun parse-update ()
+  (expect-word "UPDATE")
+  (let ((table (parse-table-reference)))
+    (expect-word "SET")
+    (let ((assignments (parse-comma-list
+                        #'(lambda ()
+                            (let ((column (parse-name "a column name")))
+                              (expect-symbol "=")
+                              (list column (parse-expression)))))))
+      (list :update table assignments (and (accept-word "WHERE") (parse-expression))))))
+
+;; DELETE gives (:delete table-reference where).
+(defun parse-delete ()
+  (expect-word "DELETE")
+  (expect-word "FROM")
+  (let ((table (parse-table-reference)))
+    (list :delete table (and (accept-word "WHERE") (parse-expression)))))
+
 (defun parse-statement ()
   (cond ((at-word "SELECT") (parse-select))
+        ((at-word "INSERT") (parse-insert))
+        ((at-word "UPDATE") (parse-update))
+        ((at-word "DELETE") (parse-delete))
         (t (parse-fail "This statement is not supported"))))
