@@ -348,17 +348,69 @@
           (parse-fail "Expected ON. A join needs a condition"))
         (list kind table (parse-expression))))))
 
-;; A query: for now one SELECT. Set operations come next.
-(defun parse-query ()
-  (parse-select))
+;;; Queries
+;;;
+;;; A query is one SELECT, or SELECTs joined by UNION [ALL], INTERSECT and EXCEPT, with
+;;; ORDER BY, LIMIT and OFFSET at the end. INTERSECT binds tighter than UNION and EXCEPT, and
+;;; the others go from left to right. A query in brackets can be an operand. The trees:
+;;;   (:select ...)                       one SELECT, with its own :order :limit :offset
+;;;   (:setop kind all left right)        KIND is :union, :intersect or :except
+;;;   (:compound setop order limit offset)  a set operation with ORDER BY, LIMIT or OFFSET
 
+(defun parse-set-operand ()
+  (if (accept-symbol "(")
+      (prog1 (parse-query) (expect-symbol ")"))
+      (parse-select)))
+
+(defun parse-intersect-term ()
+  (let ((left (parse-set-operand)))
+    (loop while (accept-word "INTERSECT")
+          do (when (at-word "ALL")
+               (parse-fail "INTERSECT ALL is not supported"))
+             (accept-word "DISTINCT")
+             (setf left (list :setop :intersect nil left (parse-set-operand))))
+    left))
+
+(defun parse-set-expression ()
+  (let ((left (parse-intersect-term)))
+    (loop
+      (cond ((accept-word "UNION")
+             (let ((all (and (accept-word "ALL") t)))
+               (unless all (accept-word "DISTINCT"))
+               (setf left (list :setop :union all left (parse-intersect-term)))))
+            ((accept-word "EXCEPT")
+             (when (at-word "ALL")
+               (parse-fail "EXCEPT ALL is not supported"))
+             (accept-word "DISTINCT")
+             (setf left (list :setop :except nil left (parse-intersect-term))))
+            (t (return))))
+    left))
+
+(defun parse-query ()
+  (let ((tree (parse-set-expression))
+        order limit offset)
+    (when (accept-word "ORDER")
+      (expect-word "BY")
+      (setf order (parse-comma-list #'parse-sql-order-key)))
+    (loop
+      (cond ((and (null limit) (accept-word "LIMIT")) (setf limit (parse-expression)))
+            ((and (null offset) (accept-word "OFFSET")) (setf offset (parse-expression)))
+            (t (return))))
+    (cond ((not (or order limit offset)) tree)
+          ((eq (first tree) :select)
+           ;; a single SELECT keeps them as its own
+           (setf (getf (cdr tree) :order) order
+                 (getf (cdr tree) :limit) limit
+                 (getf (cdr tree) :offset) offset)
+           tree)
+          (t (list :compound tree order limit offset)))))
+
+;; One SELECT, up to HAVING. ORDER BY, LIMIT and OFFSET belong to the query around it.
 (defun parse-select ()
   (expect-word "SELECT")
-  (when (or (at-word "UNION") (at-word "INTERSECT") (at-word "EXCEPT"))
-    (parse-fail "Set operations are not supported"))
   (let* ((distinct (and (accept-word "DISTINCT") t))
          (items (parse-comma-list #'parse-select-item))
-         from joins where group having order limit offset)
+         from joins where group having)
     (unless (accept-word "FROM")
       (parse-fail "Expected FROM. A SELECT without a table is not supported"))
     (setf from (parse-table-reference t))
@@ -371,17 +423,8 @@
       (expect-word "BY")
       (setf group (parse-comma-list #'parse-expression)))
     (when (accept-word "HAVING") (setf having (parse-expression)))
-    (when (accept-word "ORDER")
-      (expect-word "BY")
-      (setf order (parse-comma-list #'parse-sql-order-key)))
-    (loop
-      (cond ((and (null limit) (accept-word "LIMIT")) (setf limit (parse-expression)))
-            ((and (null offset) (accept-word "OFFSET")) (setf offset (parse-expression)))
-            (t (return))))
-    (when (or (at-word "UNION") (at-word "INTERSECT") (at-word "EXCEPT"))
-      (parse-fail "Set operations are not supported"))
     (list :select :distinct distinct :items items :from from :joins joins :where where
-                  :group group :having having :order order :limit limit :offset offset)))
+                  :group group :having having :order nil :limit nil :offset nil)))
 
 ;; Parse TEXT, which holds one or more statements separated by semicolons. Return the
 ;; list of trees and the number of ? parameters in all of them.
@@ -421,7 +464,7 @@
                                       (parse-expression))))
                         (expect-symbol ")"))))
                  nil))
-          ((at-word "SELECT") (list :insert table columns nil (parse-select)))
+          ((at-word "SELECT") (list :insert table columns nil (parse-query)))
           (t (parse-fail "Expected VALUES or SELECT")))))
 
 ;; UPDATE gives (:update table-reference ((column tree) ...) where).
@@ -565,7 +608,7 @@
          (multiple-value-bind (name quoted) (parse-name "a view name")
            (expect-word "AS")
            (let* ((before *param-count*)
-                  (select (parse-select)))
+                  (select (parse-query)))
              (unless (= before *param-count*)
                (parse-fail "A view can't have ? parameters. Write the values in the query"))
              (list :create-view name quoted if-not-exists select)))))
@@ -620,11 +663,11 @@
                 (t (parse-fail "Expected ADD, DROP or RENAME"))))))
 
 (defun parse-statement ()
-  (cond ((at-word "SELECT") (parse-select))
+  (cond ((or (at-word "SELECT") (and (at-symbol "(") (at-word "SELECT" 1))) (parse-query))
         ((accept-word "EXPLAIN")
          (unless (at-word "SELECT")
            (parse-fail "EXPLAIN works for SELECT only"))
-         (list :explain (parse-select)))
+         (list :explain (parse-query)))
         ((at-word "INSERT") (parse-insert))
         ((at-word "UPDATE") (parse-update))
         ((at-word "DELETE") (parse-delete))

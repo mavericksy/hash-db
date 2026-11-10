@@ -103,7 +103,7 @@
     (is (search "Expected FROM" (fails "SELECT 1")))
     (is (search "Expected FROM" (fails "SELECT name")))
     (is (search "list of tables" (fails "SELECT * FROM people, pets")))
-    (is (search "Set operations" (fails "SELECT id FROM people UNION SELECT id FROM people")))
+    (is (null (fails "SELECT id FROM people UNION SELECT id FROM people")) "set operations are supported")
     (is (search "column number" (fails "SELECT name FROM people ORDER BY 1")))
     (is (search "Unknown column nope" (fails "SELECT nope FROM people")))
     (is (search "Unknown column nope" (fails "SELECT name FROM people WHERE nope = 1")))

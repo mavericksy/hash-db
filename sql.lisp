@@ -444,8 +444,11 @@
     (let ((view-name (sql-new-name name quoted)))
       (if (and if-not-exists (nth-value 1 (fset:lookup (current-root) view-name)))
           nil
-          (let ((*subqueries-allowed* nil))
-            (apply #'create-view view-name (translate-select select)))))))
+          (progn
+            (unless (eq (first select) :select)
+              (sql-fail *sql-text* nil "A view can't be a UNION, INTERSECT or EXCEPT"))
+            (let ((*subqueries-allowed* nil))
+              (apply #'create-view view-name (translate-select select))))))))
 
 (defun execute-create-sequence (ast)
   (destructuring-bind (name quoted if-not-exists start increment) (rest ast)
@@ -512,9 +515,66 @@
          (rename-table table-name (sql-new-name (second action) nil)))))))
 
 ;; Run a query and give its table.
+;; The rows of TABLE as lists of values, by position.
+(defun table-value-lists (table)
+  (let ((keys (mapcar #'name (schema table))))
+    (mapcar #'(lambda (row) (mapcar #'(lambda (key) (getf row key)) keys)) (row-list table))))
+
+;; Combine the rows of two tables, by position. The columns are named as the first table
+;; names them. Rows are equal when their values are equal, and NULL equals NULL.
+(defun combine-tables (kind all left right)
+  (unless (= (length (schema left)) (length (schema right)))
+    (sql-fail *sql-text* nil "The queries of a ~A must give the same number of columns, and these give ~D and ~D"
+              (string-upcase (symbol-name kind)) (length (schema left)) (length (schema right))))
+  (let* ((schema (mapcar #'(lambda (column) (make-result-column (name column) column)) (schema left)))
+         (left-values (table-value-lists left))
+         (right-values (table-value-lists right))
+         (seen (make-hash-table :test 'equal))
+         (in-right (make-hash-table :test 'equal))
+         (result '()))
+    (flet ((key (values) (mapcar #'distinct-key values)))
+      (dolist (values right-values)
+        (setf (gethash (key values) in-right) t))
+      (ecase kind
+        (:union
+         (dolist (values (append left-values right-values))
+           (when (or all (not (gethash (key values) seen)))
+             (setf (gethash (key values) seen) t)
+             (push values result))))
+        (:intersect
+         (dolist (values left-values)
+           (when (and (gethash (key values) in-right) (not (gethash (key values) seen)))
+             (setf (gethash (key values) seen) t)
+             (push values result))))
+        (:except
+         (dolist (values left-values)
+           (when (and (not (gethash (key values) in-right)) (not (gethash (key values) seen)))
+             (setf (gethash (key values) seen) t)
+             (push values result))))))
+    (make-result-table (mapcar #'(lambda (values)
+                                   (loop for column in schema
+                                         for value in values
+                                         append (list (name column) value)))
+                               (nreverse result))
+                       schema)))
+
+;; Run a query and give its table.
 (defun run-query (ast)
   (ecase (first ast)
-    (:select (apply #'select (translate-select ast)))))
+    (:select (apply #'select (translate-select ast)))
+    (:setop
+     (destructuring-bind (kind all left right) (rest ast)
+       (combine-tables kind all (run-query left) (run-query right))))
+    (:compound
+     ;; ORDER BY, LIMIT and OFFSET of a set operation work on its result, by column name
+     (destructuring-bind (setop order limit offset) (rest ast)
+       (let* ((table (run-query setop))
+              (*scope* (list (make-scope-entry "" nil (schema table) nil)))
+              (*aliases* nil))
+         (select :from table
+                 :order-by (and order (mapcar #'translate-order-key order))
+                 :limit (and limit (translate-count limit "LIMIT"))
+                 :offset (and offset (translate-count offset "OFFSET"))))))))
 
 ;; Run a subquery. It is worked out once, now, and does not see the tables of the query
 ;; around it, so it can not be correlated with it.
@@ -528,7 +588,7 @@
 
 (defun execute-statement (ast)
   (ecase (first ast)
-    (:select (run-query ast))
+    ((:select :setop :compound) (run-query ast))
     (:insert (execute-insert ast))
     (:update (execute-update ast))
     (:delete (execute-delete ast))
@@ -538,7 +598,10 @@
     (:create-sequence (execute-create-sequence ast))
     (:drop (execute-drop ast))
     (:alter-table (execute-alter-table ast))
-    (:explain (apply #'explain (translate-select (second ast))))))
+    (:explain
+     (unless (eq (first (second ast)) :select)
+       (sql-fail *sql-text* nil "EXPLAIN works for one SELECT, not for UNION, INTERSECT or EXCEPT"))
+     (apply #'explain (translate-select (second ast))))))
 
 ;; EXPLAIN SELECT ... gives the steps of the query, as explain does. Run one statement of SQL and
 ;; return its result. The ? in it take the values after TEXT.
