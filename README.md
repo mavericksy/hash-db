@@ -172,7 +172,10 @@ An expression is data. A keyword is a column. `:null` is NULL. Numbers, strings,
 | `(is-null a)` `(is-not-null a)` `(coalesce a b ...)` | NULL tests |
 | `(+ a b ...)` `(- a b)` `(* a b ...)` `(/ a b)` | arithmetic |
 | `(lower a)` `(upper a)` `(length a)` `(concat a b ...)` | strings |
+| `(case c1 v1 c2 v2 ... [else])` | the value of the first true condition. Only that value is worked out. No else gives NULL |
 | `(fn f a b ...)` | call your function with the values. It sees NULL as `:null` |
+| `(date "2024-01-31")` `(timestamp "2024-01-31 12:30:00")` `(today)` | a universal time. See Dates |
+| `(date-text x)` `(timestamp-text x)` `(year x)` `(month x)` `(day x)` `(hour x)` `(minute x)` `(second x)` `(dow x)` | read a universal time |
 
 Operators match by name, so `(like ...)` and `(:like ...)` both work.
 
@@ -422,6 +425,23 @@ A `json` column holds JSON text. It is checked when a row is written and kept in
 - Ids are generated, so values for a primary key column in a file are ignored.
 - A file path is written through a temporary file and renamed.
 
+## Dates
+
+A `timestamp` column holds a universal time: whole seconds since 1900-01-01 00:00:00 UTC. The date expressions work on it, in UTC, from 1900 on.
+
+```lisp
+(select :from "events" :where '(between :at (date "2024-02-01") (timestamp "2024-02-29 23:59:59")))
+(select :from "events" :col '((as (date-text :at) :day) (as (year :at) :y)) :where '(= (dow :at) 1))
+(parse-timestamp "2024-01-31 12:30:00")      ; => a universal time
+(format-timestamp 3919200000)                ; => "2024-01-31 12:00:00"
+```
+
+- `(date text)` and `(timestamp text)` read `YYYY-MM-DD`, or `YYYY-MM-DD HH:MM[:SS]` with a space or `T` and an optional `Z`. A bad date, such as February 30, is a `query-error`.
+- `(today)` is the start of today. It uses `(now)`, so setting `*clock*` sets it.
+- `(dow x)` is 0 for Sunday to 6 for Saturday.
+- To add time, add seconds: `(+ :at 86400)` is a day later. NULL gives NULL.
+- A date given as a constant is worked out first, so an index on the column is used.
+
 ## History
 
 ```lisp
@@ -458,7 +478,8 @@ History is off by default and kept in memory only. Kept versions hold the memory
 
 | Statement | Notes |
 |-----------|-------|
-| `SELECT` | `DISTINCT`, `*` and `t.*`, `expr AS alias`, `FROM table [alias]`, `[INNER\|LEFT\|RIGHT\|FULL [OUTER]] JOIN t [alias] ON a = b` in a chain, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`, `OFFSET` |
+| `SELECT` | `DISTINCT`, `*` and `t.*`, `expr AS alias`, `FROM table [alias]`, `FROM (SELECT ...) alias`, `[INNER\|LEFT\|RIGHT\|FULL [OUTER]] JOIN t [alias] ON a = b` in a chain, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`, `OFFSET` |
+| `UNION [ALL]`, `INTERSECT`, `EXCEPT` | between `SELECT`s, in brackets if you like, with `ORDER BY`, `LIMIT` and `OFFSET` for the whole result |
 | `INSERT` | `INSERT INTO t [(cols)] VALUES (...), (...)` and `INSERT INTO t [(cols)] SELECT ...`. `DEFAULT` leaves a column out |
 | `UPDATE`, `DELETE` | with or without `WHERE`. Without it they change every row |
 | `CREATE TABLE` | types `INTEGER`, `REAL`/`FLOAT`, `NUMERIC`, `TEXT`/`VARCHAR`, `BOOLEAN`, `TIMESTAMP`, `JSON`. `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `REFERENCES t(id) [ON DELETE CASCADE\|SET NULL\|RESTRICT]`, as column or table constraints. `IF NOT EXISTS` |
@@ -467,7 +488,11 @@ History is off by default and kept in memory only. Kept versions hold the memory
 | `ALTER TABLE` | `ADD [COLUMN] def`, `DROP [COLUMN] c`, `RENAME [COLUMN] a TO b`, `RENAME TO t` |
 | `EXPLAIN SELECT` | |
 
-Expressions: `OR AND NOT`, `= <> != < > <= >=`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] BETWEEN`, `[NOT] LIKE`, `+ - * /`, `||`, and the functions `LOWER`, `UPPER`, `LENGTH`, `COALESCE`, `COUNT` (also `COUNT(*)` and `COUNT(DISTINCT x)`), `SUM`, `AVG`, `MIN`, `MAX`, `JSON_GET`, `NOW()`, `CURRENT_TIMESTAMP`, `NEXTVAL('s')` and `CURRVAL('s')`.
+Expressions: `OR AND NOT`, `= <> != < > <= >=`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] IN (SELECT ...)`, `EXISTS (SELECT ...)`, `(SELECT ...)` as a value, `[NOT] BETWEEN`, `[NOT] LIKE`, `CASE WHEN ... THEN ... [ELSE ...] END` and `CASE x WHEN ...`, `+ - * /`, `||`, `DATE '2024-01-31'`, `TIMESTAMP '2024-01-31 12:30:00'`, `CURRENT_DATE`, `EXTRACT(YEAR FROM x)`, and the functions `LOWER`, `UPPER`, `LENGTH`, `COALESCE`, `COUNT` (also `COUNT(*)` and `COUNT(DISTINCT x)`), `SUM`, `AVG`, `MIN`, `MAX`, `JSON_GET`, `NOW()`, `CURRENT_TIMESTAMP`, `DATE_TEXT`, `TIMESTAMP_TEXT`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DOW`, `NEXTVAL('s')` and `CURRVAL('s')`.
+
+**Subqueries** are worked out once, when the statement starts, and the answer becomes a constant. So a subquery cannot use the tables of the query around it. A correlated subquery is refused, and the message says which name belongs to the outer query. A subquery that is a value must give one column and at most one row (none gives NULL). `x IN (SELECT ...)` over an empty answer is false. A view cannot hold a subquery, because it would keep the answer and not the query. An index of the outer table is used for the constant, as for any other. `EXPLAIN` works the subqueries out too.
+
+**Set operations** match columns by position, name them by the first query, and need the same number of columns. Rows are equal when all their values are equal, NULL equals NULL, and `1` equals `1.0`. `INTERSECT` binds tighter than `UNION` and `EXCEPT`. `INTERSECT ALL` and `EXCEPT ALL` are refused. `EXPLAIN` and `CREATE VIEW` take one `SELECT` only.
 
 **Names and types**
 
@@ -475,10 +500,10 @@ Expressions: `OR AND NOT`, `= <> != < > <= >=`, `IS [NOT] NULL`, `[NOT] IN (...)
 - A column name in SQL has no hyphen, so `pet_ref` also finds the column `PET-REF`. An exact match comes first.
 - Each joined table is joined with its alias, or its name, as the prefix. `SELECT *` and `t.*` give plain column names. When two items would have the same name, they are named `table.column`.
 - `id INTEGER PRIMARY KEY` is a generated key. Leave it out of `INSERT`.
-- `TIMESTAMP` holds a universal time, a whole number, not a date text. `TEXT` is a string.
+- `TIMESTAMP`, `DATETIME` and `DATE` are one type. They hold a universal time, a whole number of seconds since 1900-01-01 UTC, not a date text. Write dates as `DATE '2024-01-31'`. `TEXT` is a string.
 - A `CHECK` is kept as an expression, so it survives a save and a restart. It can name one column.
 
-**Not supported.** Each gives a `sql-error` that says so: subqueries, `UNION` and its kin, `CASE`, `SELECT` without `FROM`, a list of tables (`FROM a, b`), `CROSS` and `NATURAL JOIN`, `USING`, an `ON` that is not one equality, `ORDER BY` a column number, `%`, keys and unique constraints of several columns, named constraints, `ON UPDATE`, `ADD CONSTRAINT`, and types such as `DATE` and `BLOB`.
+**Not supported.** Each gives a `sql-error` that says so: correlated subqueries, `INTERSECT ALL` and `EXCEPT ALL`, `SELECT` without `FROM`, a list of tables (`FROM a, b`), `CROSS` and `NATURAL JOIN`, `USING`, an `ON` that is not one equality, `ORDER BY` a column number, `%`, `INTERVAL`, keys and unique constraints of several columns, named constraints, `ON UPDATE`, `ADD CONSTRAINT`, and types such as `BLOB`.
 
 A `sql-error` tells the line and column, and shows the text near it. `error-position` and `error-sql` give the details.
 
