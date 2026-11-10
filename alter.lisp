@@ -28,6 +28,28 @@
 (defun spec-column-name (spec)
   (first spec))
 
+;; A :check expression names its own column. When the column is renamed the
+;; expression must name the new one. A quoted constant is left alone.
+(defun rename-in-expression (expr old new)
+  (cond ((eq expr old) new)
+        ((atom expr) expr)
+        ((and (symbolp (first expr)) (string= (symbol-name (first expr)) "QUOTE")) expr)
+        ((and (symbolp (first expr)) (string= (symbol-name (first expr)) "FN"))
+         (list* (first expr) (second expr)
+                (mapcar #'(lambda (part) (rename-in-expression part old new)) (cddr expr))))
+        (t (cons (first expr)
+                 (mapcar #'(lambda (part) (rename-in-expression part old new)) (rest expr))))))
+
+;; The column spec (name type . options) with its :check expression renamed.
+(defun rename-spec-check (spec old new)
+  (destructuring-bind (name type &rest options) spec
+    (let ((check (getf options :check)))
+      (if (consp check)
+          (let ((options (copy-list options)))
+            (setf (getf options :check) (rename-in-expression check old new))
+            (list* name type options))
+          spec))))
+
 (defun root-rename-column (root table old new)
   (let ((tbl (root-table root table)))
     (let ((old (name (find-column old (schema tbl))))
@@ -41,7 +63,10 @@
            (destructuring-bind (name pk specs id-rows index-specs trigger-specs ttl) snapshot
              (flet ((rename (key) (if (eq key old) new key)))
                (list name pk
-                     (mapcar #'(lambda (spec) (cons (rename (first spec)) (rest spec))) specs)
+                     (mapcar #'(lambda (spec)
+                                 (let ((spec (rename-spec-check spec old new)))
+                                   (cons (rename (first spec)) (rest spec))))
+                             specs)
                      (mapcar #'(lambda (id-row)
                                  (cons (car id-row)
                                        (loop for (key value) on (cdr id-row) by #'cddr
