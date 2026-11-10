@@ -29,6 +29,7 @@
                (:file "sql-lexer")
                (:file "sql-parser")
                (:file "sql-translate")
+               (:file "sql")
                ;; the write-ahead log needs SBCL: sb-posix and sb-ext
                (:file "wal" :if-feature :sbcl))
   :in-order-to ((test-op (test-op #:hash-db/tests))))
@@ -50,7 +51,8 @@
                              (:file "io-tests")
                              (:file "history-tests")
                              (:file "sql-lexer-tests")
-                             (:file "sql-expr-tests"))))
+                             (:file "sql-expr-tests")
+                             (:file "sql-select-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))

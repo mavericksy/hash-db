@@ -230,3 +230,98 @@
       (unless (at-end-p)
         (parse-fail "Unexpected text after the expression"))
       (values ast *param-count*))))
+
+;;; Statements
+;;;
+;;; SELECT gives (:select :distinct d :items items :from (table quoted alias) :joins joins
+;;;               :where e :group (e ...) :having e :order (key ...) :limit e :offset e)
+;;; An item is (:star qualifier) or (:expr tree alias). An order key is (tree direction nulls).
+
+(defun parse-select-item ()
+  (cond ((accept-symbol "*") (list :star nil))
+        ((and (eq (token-type (tok)) :word) (at-symbol "." 1) (at-symbol "*" 2))
+         (let ((qualifier (parse-name "a table name")))
+           (advance)
+           (advance)
+           (list :star qualifier)))
+        (t (let ((tree (parse-expression))
+                 (alias nil))
+             (cond ((accept-word "AS") (setf alias (parse-name "a name after AS")))
+                   ((and (eq (token-type (tok)) :word)
+                         (or (token-quoted (tok)) (not (reserved-token-p (tok)))))
+                    (setf alias (parse-name "a name"))))
+             (list :expr tree alias)))))
+
+(defun parse-sql-order-key ()
+  (let ((tree (parse-expression))
+        (direction :asc)
+        (nulls nil))
+    (cond ((accept-word "DESC") (setf direction :desc))
+          ((accept-word "ASC")))
+    (when (accept-word "NULLS")
+      (cond ((accept-word "FIRST") (setf nulls :first))
+            ((accept-word "LAST") (setf nulls :last))
+            (t (parse-fail "Expected FIRST or LAST"))))
+    (list tree direction nulls)))
+
+(defun parse-comma-list (parser)
+  (let ((items (list (funcall parser))))
+    (loop while (accept-symbol ",") do (push (funcall parser) items))
+    (nreverse items)))
+
+(defun parse-table-reference ()
+  "A table name and its alias. Return (name quoted alias)."
+  (multiple-value-bind (name quoted) (parse-name "a table name")
+    (let ((alias (cond ((accept-word "AS") (parse-name "an alias after AS"))
+                       ((and (eq (token-type (tok)) :word)
+                             (or (token-quoted (tok)) (not (reserved-token-p (tok)))))
+                        (parse-name "an alias")))))
+      (list name quoted alias))))
+
+(defun parse-select ()
+  (expect-word "SELECT")
+  (when (or (at-word "UNION") (at-word "INTERSECT") (at-word "EXCEPT"))
+    (parse-fail "Set operations are not supported"))
+  (let* ((distinct (and (accept-word "DISTINCT") t))
+         (items (parse-comma-list #'parse-select-item))
+         from joins where group having order limit offset)
+    (unless (accept-word "FROM")
+      (parse-fail "Expected FROM. A SELECT without a table is not supported"))
+    (setf from (parse-table-reference))
+    (when (accept-symbol ",")
+      (parse-fail "A list of tables is not supported. Use JOIN ... ON"))
+    (when (accept-word "WHERE") (setf where (parse-expression)))
+    (when (accept-word "GROUP")
+      (expect-word "BY")
+      (setf group (parse-comma-list #'parse-expression)))
+    (when (accept-word "HAVING") (setf having (parse-expression)))
+    (when (accept-word "ORDER")
+      (expect-word "BY")
+      (setf order (parse-comma-list #'parse-sql-order-key)))
+    (loop
+      (cond ((and (null limit) (accept-word "LIMIT")) (setf limit (parse-expression)))
+            ((and (null offset) (accept-word "OFFSET")) (setf offset (parse-expression)))
+            (t (return))))
+    (when (or (at-word "UNION") (at-word "INTERSECT") (at-word "EXCEPT"))
+      (parse-fail "Set operations are not supported"))
+    (list :select :distinct distinct :items items :from from :joins joins :where where
+                  :group group :having having :order order :limit limit :offset offset)))
+
+;; Parse TEXT, which holds one or more statements separated by semicolons. Return the
+;; list of trees and the number of ? parameters in all of them.
+(defun sql-parse (text)
+  (with-sql-parser (text)
+    (let ((statements '()))
+      (loop
+        (loop while (accept-symbol ";"))
+        (when (at-end-p) (return))
+        (push (parse-statement) statements)
+        (unless (or (at-symbol ";") (at-end-p))
+          (parse-fail "Unexpected text after the statement")))
+      (unless statements
+        (parse-fail "There is no statement"))
+      (values (nreverse statements) *param-count*))))
+
+(defun parse-statement ()
+  (cond ((at-word "SELECT") (parse-select))
+        (t (parse-fail "This statement is not supported"))))
