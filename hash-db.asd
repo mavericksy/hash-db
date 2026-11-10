@@ -56,7 +56,8 @@
                              (:file "sql-join-tests")
                              (:file "sql-write-tests")
                              (:file "sql-ddl-tests")
-                             (:file "sql-script-tests"))))
+                             (:file "sql-script-tests")
+                             (:file "case-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))

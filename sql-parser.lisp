@@ -205,7 +205,7 @@
              ((at-word "NULL") (advance) (list :lit :null))
              ((at-word "TRUE") (advance) (list :lit t))
              ((at-word "FALSE") (advance) (list :lit nil))
-             ((at-word "CASE") (parse-fail "CASE is not supported"))
+             ((at-word "CASE") (parse-case))
              ((at-word "CURRENT_TIMESTAMP") (advance) (list :call "NOW" nil nil nil))
              ((reserved-token-p token) (parse-fail "Expected an expression"))
              ((at-symbol "(" 1)
@@ -221,6 +221,23 @@
     (if (accept-symbol ".")
         (list :col first (parse-name "a column name"))
         (list :col nil first))))
+
+;; CASE [operand] WHEN a THEN b ... [ELSE c] END gives (:case operand ((a b) ...) else).
+(defun parse-case ()
+  (expect-word "CASE")
+  (let ((operand (unless (or (at-word "WHEN") (at-word "END")) (parse-expression)))
+        (whens '())
+        (else nil))
+    (unless (at-word "WHEN")
+      (parse-fail "Expected WHEN"))
+    (loop while (accept-word "WHEN")
+          do (let ((condition (parse-expression)))
+               (expect-word "THEN")
+               (push (list condition (parse-expression)) whens)))
+    (when (accept-word "ELSE")
+      (setf else (parse-expression)))
+    (expect-word "END")
+    (list :case operand (nreverse whens) else)))
 
 ;; Parse TEXT as one expression and nothing else.
 (defun sql-parse-expression (text)

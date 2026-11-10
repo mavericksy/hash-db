@@ -173,6 +173,16 @@
      (destructuring-bind (x pattern negated) (rest ast)
        (let ((form (list (dsl-op "LIKE") (translate-expression x) (translate-expression pattern))))
          (if negated (list (dsl-op "NOT") form) form))))
+    (:case
+     (destructuring-bind (operand whens else) (rest ast)
+       (let ((operand (and operand (translate-expression operand))))
+         (append (list (dsl-op "CASE"))
+                 (loop for (condition value) in whens
+                       append (list (if operand
+                                        (list (dsl-op "=") operand (translate-expression condition))
+                                        (translate-expression condition))
+                                    (translate-expression value)))
+                 (and else (list (translate-expression else)))))))
     (:call
      (destructuring-bind (name args distinct star) (rest ast)
        (translate-call name args distinct star)))))

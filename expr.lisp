@@ -375,6 +375,20 @@
           (let ((v (funcall f row)))
             (unless (nullish-p v) (return v)))))))
 
+;;; CASE: (case c1 v1 c2 v2 ... [else]). The first condition that is true gives its value,
+;;; and only that value is worked out. With no else and no true condition the result is NULL.
+
+(define-op "CASE" (args ctx)
+  (check-arity "CASE" args 2 nil)
+  (let* ((fns (compile-args args ctx))
+         (else (and (oddp (length fns)) (car (last fns)))))
+    #'(lambda (row)
+        (loop for (condition value) on fns by #'cddr
+              while value
+              do (when (eq t (truth (funcall condition row)))
+                   (return (funcall value row)))
+              finally (return (if else (funcall else row) :null))))))
+
 ;;; Your own functions
 
 (define-op "FN" (args ctx)
