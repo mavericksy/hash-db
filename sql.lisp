@@ -256,12 +256,260 @@
              (*aliases* nil))
         (delete-where table-name :where (if where (translate-expression where) t))))))
 
+;;; CREATE, DROP and ALTER
+
+;; The name of a table, view or sequence that a statement makes. It is read in lower
+;; case unless it is "quoted".
+(defun sql-new-name (text quoted)
+  (if quoted text (string-downcase text)))
+
+(defparameter *sql-types*
+  '(("INTEGER" . integer) ("INT" . integer) ("BIGINT" . integer) ("SMALLINT" . integer)
+    ("TINYINT" . integer)
+    ("REAL" . float) ("FLOAT" . float) ("DOUBLE" . float)
+    ("NUMERIC" . number) ("DECIMAL" . number) ("NUMBER" . number)
+    ("TEXT" . string) ("VARCHAR" . string) ("CHAR" . string) ("CHARACTER" . string)
+    ("STRING" . string) ("CLOB" . string)
+    ("BOOLEAN" . boolean) ("BOOL" . boolean)
+    ("TIMESTAMP" . timestamp) ("DATETIME" . timestamp)
+    ("JSON" . json) ("JSONB" . json) ("KEYWORD" . keyword) ("ANY" . any)))
+
+(defun sql-column-type (name)
+  (or (cdr (assoc name *sql-types* :test #'string=))
+      (sql-fail *sql-text* nil "The column type ~A is not supported. Supported: ~{~A~^, ~}"
+                name (mapcar #'car *sql-types*))))
+
+;; One column while a CREATE TABLE is read. OPTIONS is a plist for make-col.
+(defstruct (colspec (:constructor make-colspec (name type options)))
+  name
+  type
+  options)
+
+(defun colspec-set (colspec option value)
+  (setf (getf (colspec-options colspec) option) value))
+
+;; The primary key a table has, or will have, as a keyword. SELF is the table being made.
+(defun referenced-key (table-name column-name self-name self-key)
+  (let ((key (if (equal table-name self-name)
+                 self-key
+                 (let ((object (named-object table-name)))
+                   (unless (typep object 'table)
+                     (error 'no-such-table :table table-name
+                                           :message (format nil "The table: ~A does not exist" table-name)))
+                   (let ((pk (find-if #'(lambda (c) (typep c 'primary-key-column)) (schema object))))
+                     (and pk (name pk)))))))
+    (unless key
+      (sql-fail *sql-text* nil "Table ~A has no primary key, so a foreign key can not refer to it" table-name))
+    (when (and column-name (not (eq (as-keyword column-name) key))
+               (not (eq (as-keyword (substitute #\- #\_ column-name)) key)))
+      (sql-fail *sql-text* nil "A foreign key refers to the primary key of ~A, which is ~A, not ~A"
+                table-name key column-name))
+    key))
+
+(defun make-reference (colspec references self-name self-key)
+  (destructuring-bind (table quoted column action) (rest references)
+    (unless (eq (colspec-type colspec) 'integer)
+      (sql-fail *sql-text* nil "A column with REFERENCES must be an integer column, not ~A" (colspec-name colspec)))
+    (let ((table-name (sql-table-name table quoted)))
+      (referenced-key table-name column self-name self-key)
+      (setf (colspec-type colspec) 'foreign-key-column)
+      (colspec-set colspec :references table-name)
+      (colspec-set colspec :on-delete action))))
+
+;; The expression of hash-db for a CHECK tree about one column.
+(defun translate-check (tree column-key)
+  (let ((*scope* (list (make-scope-entry "" nil (list (make-result-column column-key)) nil)))
+        (*aliases* nil))
+    (translate-expression tree)))
+
+;; The columns that a tree names.
+(defun tree-columns (tree)
+  (cond ((atom tree) nil)
+        ((eq (first tree) :col) (list (third tree)))
+        (t (loop for part in (rest tree) append (and (consp part) (if (keywordp (first part))
+                                                                        (tree-columns part)
+                                                                        (loop for p in part append (tree-columns p))))))))
+
+(defun colspec-from-definition (ast)
+  (destructuring-bind (name type constraints) (rest ast)
+    (let ((colspec (make-colspec (as-keyword name) (sql-column-type type) nil))
+          (checks '()))
+      (dolist (constraint constraints)
+        (ecase (first constraint)
+          (:not-null (colspec-set colspec :not-null t))
+          (:null nil)
+          (:primary-key
+           (unless (eq (colspec-type colspec) 'integer)
+             (sql-fail *sql-text* nil "A PRIMARY KEY must be an INTEGER column. Ids are generated"))
+           (setf (colspec-type colspec) 'primary-key-column))
+          (:unique (colspec-set colspec :unique t))
+          (:default
+           (let ((tree (second constraint)))
+             (if (and (eq (first tree) :call) (string= (second tree) "NOW"))
+                 (colspec-set colspec :default-fn 'now)
+                 (colspec-set colspec :default (constant-sql-value tree)))))
+          (:check (push (second constraint) checks))
+          (:references nil)))
+      (values colspec (nreverse checks)
+              (find :references constraints :key #'first)))))
+
+;; Fold a list of CHECK trees into one expression for a column.
+(defun combined-check (trees column-key)
+  (let ((checks (mapcar #'(lambda (tree) (translate-check tree column-key)) trees)))
+    (if (rest checks) (cons (dsl-op "AND") checks) (first checks))))
+
+(defun colspec-spec (colspec)
+  (list* (colspec-name colspec) (colspec-type colspec) (colspec-options colspec)))
+
+(defun execute-create-table (ast)
+  (destructuring-bind (name quoted if-not-exists elements) (rest ast)
+    (let ((table-name (sql-new-name name quoted)))
+      (if (and if-not-exists (nth-value 1 (fset:lookup (current-root) table-name)))
+          nil
+          (let ((colspecs '()) (checks '()) (references '()) (self-key nil))
+            (dolist (element elements)
+              (when (eq (first element) :column)
+                (multiple-value-bind (colspec column-checks reference) (colspec-from-definition element)
+                  (push colspec colspecs)
+                  (push (cons colspec column-checks) checks)
+                  (when reference (push (cons colspec reference) references)))))
+            (setf colspecs (nreverse colspecs))
+            (flet ((find-colspec (column-name)
+                     (or (find (as-keyword column-name) colspecs :key #'colspec-name)
+                         (find (as-keyword (substitute #\- #\_ column-name)) colspecs :key #'colspec-name)
+                         (sql-fail *sql-text* nil "The table has no column ~A" column-name))))
+              ;; constraints of the table
+              (dolist (element elements)
+                (case (first element)
+                  (:table-primary-key
+                   (let ((colspec (find-colspec (second element))))
+                     (unless (eq (colspec-type colspec) 'integer)
+                       (sql-fail *sql-text* nil "A PRIMARY KEY must be an INTEGER column. Ids are generated"))
+                     (setf (colspec-type colspec) 'primary-key-column)))
+                  (:table-unique (colspec-set (find-colspec (second element)) :unique t))
+                  (:table-foreign-key
+                   (push (cons (find-colspec (second element)) (third element)) references))
+                  (:table-check
+                   (let ((columns (remove-duplicates (tree-columns (second element)) :test #'string-equal)))
+                     (unless (= 1 (length columns))
+                       (sql-fail *sql-text* nil "A CHECK can name one column of the table, and this names ~D"
+                                 (length columns)))
+                     (let ((colspec (find-colspec (first columns))))
+                       (push (second element) (cdr (assoc colspec checks))))))))
+              (when (> (count 'primary-key-column colspecs :key #'colspec-type) 1)
+                (sql-fail *sql-text* nil "A table can have one primary key"))
+              (setf self-key (let ((pk (find 'primary-key-column colspecs :key #'colspec-type)))
+                               (and pk (colspec-name pk))))
+              (dolist (reference (reverse references))
+                (make-reference (car reference) (cdr reference) table-name self-key))
+              (dolist (entry checks)
+                (when (cdr entry)
+                  (colspec-set (car entry) :check
+                               (combined-check (reverse (cdr entry)) (colspec-name (car entry)))))))
+            (dolist (colspec colspecs)
+              (when (and (eq (colspec-type colspec) 'primary-key-column)
+                         (or (getf (colspec-options colspec) :default)
+                             (getf (colspec-options colspec) :default-fn)))
+                (sql-fail *sql-text* nil "A primary key is generated, so it can have no DEFAULT"))
+              (when (eq (colspec-type colspec) 'primary-key-column)
+                (setf (colspec-options colspec) nil)))
+            (table-name-of (make-table table-name (mapcar #'colspec-spec colspecs))))))))
+
+(defun table-name-of (table)
+  (name table))
+
+(defun execute-create-index (ast)
+  (destructuring-bind (name unique if-not-exists table quoted column) (rest ast)
+    (let* ((table-name (sql-table-name table quoted))
+           (tbl (stored-table table-name))
+           (key (name (table-column tbl column))))
+      (if (and if-not-exists name (find (as-keyword name) (indexes tbl) :key #'index-name))
+          nil
+          (create-index table-name key :name name :unique unique)))))
+
+(defun execute-create-view (ast)
+  (destructuring-bind (name quoted if-not-exists select) (rest ast)
+    (let ((view-name (sql-new-name name quoted)))
+      (if (and if-not-exists (nth-value 1 (fset:lookup (current-root) view-name)))
+          nil
+          (apply #'create-view view-name (translate-select select))))))
+
+(defun execute-create-sequence (ast)
+  (destructuring-bind (name quoted if-not-exists start increment) (rest ast)
+    (let ((sequence-name (sql-new-name name quoted)))
+      (if (and if-not-exists (nth-value 1 (fset:lookup (current-root) sequence-name)))
+          nil
+          (create-sequence sequence-name :start start :increment increment)))))
+
+(defun execute-drop (ast)
+  (destructuring-bind (kind name quoted if-exists table) (rest ast)
+    (ecase kind
+      (:table
+       (let ((table-name (sql-table-name name quoted)))
+         (cond ((typep (named-object table-name) 'table) (drop-table table-name))
+               (if-exists nil)
+               (t (error 'no-such-table :table table-name
+                                        :message (format nil "The table: ~A does not exist" table-name))))))
+      (:view
+       (let ((view-name (sql-table-name name quoted)))
+         (or (drop-view view-name)
+             (and (not if-exists) (sql-fail *sql-text* nil "No view named ~A" name)))))
+      (:sequence
+       (let ((sequence-name (sql-new-name name quoted)))
+         (cond ((drop-sequence sequence-name) t)
+               (if-exists nil)
+               (t (error 'no-such-sequence :name sequence-name
+                                           :message (format nil "The sequence: ~A does not exist" sequence-name))))))
+      (:index
+       (let* ((tables (if table
+                          (list (stored-table (sql-table-name table nil)))
+                          (all-tables)))
+              ;; an SQL name has no hyphen, so age_index also finds AGE-INDEX
+              (key (or (find-if #'(lambda (candidate)
+                                    (some #'(lambda (tbl) (index-named tbl candidate)) tables))
+                                (list (as-keyword name) (as-keyword (substitute #\- #\_ name))))
+                       (as-keyword name)))
+              (owners (remove-if-not #'(lambda (tbl) (index-named tbl key)) tables)))
+         (cond ((null owners)
+                (if if-exists nil (sql-fail *sql-text* nil "No index named ~A" name)))
+               ((rest owners)
+                (sql-fail *sql-text* nil "Index ~A is on more than one table. Write DROP INDEX ~A ON table" name name))
+               (t (drop-index key (name (first owners))))))))))
+
+(defun execute-alter-table (ast)
+  (destructuring-bind (name quoted action) (rest ast)
+    (let* ((table-name (sql-table-name name quoted))
+           (tbl (stored-table table-name)))
+      (ecase (first action)
+        (:add-column
+         (multiple-value-bind (colspec checks reference) (colspec-from-definition (second action))
+           (when reference
+             (make-reference colspec reference table-name nil))
+           (when (eq (colspec-type colspec) 'primary-key-column)
+             (sql-fail *sql-text* nil "A primary key column can not be added to a table that exists"))
+           (when checks
+             (colspec-set colspec :check (combined-check checks (colspec-name colspec))))
+           (add-column table-name (colspec-spec colspec))
+           (colspec-name colspec)))
+        (:drop-column
+         (drop-column table-name (name (table-column tbl (second action)))))
+        (:rename-column
+         (rename-column table-name (name (table-column tbl (second action))) (as-keyword (third action))))
+        (:rename-table
+         (rename-table table-name (sql-new-name (second action) nil)))))))
+
 (defun execute-statement (ast)
   (ecase (first ast)
     (:select (apply #'select (translate-select ast)))
     (:insert (execute-insert ast))
     (:update (execute-update ast))
-    (:delete (execute-delete ast))))
+    (:delete (execute-delete ast))
+    (:create-table (execute-create-table ast))
+    (:create-index (execute-create-index ast))
+    (:create-view (execute-create-view ast))
+    (:create-sequence (execute-create-sequence ast))
+    (:drop (execute-drop ast))
+    (:alter-table (execute-alter-table ast))))
 
 ;; Run one statement of SQL and return its result. The ? in it take the values after TEXT.
 ;; A SELECT gives a table, so use row-list or sql-rows to read it. INSERT gives the number of
