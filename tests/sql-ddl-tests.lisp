@@ -123,7 +123,7 @@
            (handler-case (progn (sql text) nil)
              (sql-error (c) (error-message c)))))
     (is (search "not supported. Supported:" (fails "CREATE TABLE t (a BLOB)")))
-    (is (search "not supported. Supported:" (fails "CREATE TABLE t (a DATE)")))
+    (is (search "not supported. Supported:" (fails "CREATE TABLE t (a INTERVAL)")))
     (is (search "PRIMARY KEY must be an INTEGER" (fails "CREATE TABLE t (a TEXT PRIMARY KEY)")))
     (is (search "one primary key" (fails "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)")))
     (is (search "no DEFAULT" (fails "CREATE TABLE t (a INTEGER PRIMARY KEY DEFAULT 5)")))

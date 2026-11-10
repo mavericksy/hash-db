@@ -95,7 +95,8 @@
 
 (defparameter *sql-functions*
   '("LOWER" "UPPER" "LENGTH" "CHAR_LENGTH" "COALESCE" "COUNT" "SUM" "AVG" "MIN" "MAX" "JSON_GET"
-    "NOW" "NEXTVAL" "CURRVAL"))
+    "NOW" "NEXTVAL" "CURRVAL" "DATE" "TIMESTAMP" "DATE_TEXT" "TIMESTAMP_TEXT" "YEAR" "MONTH" "DAY"
+    "HOUR" "MINUTE" "SECOND" "DOW" "TODAY"))
 
 (defun check-function-arity (name args min &optional (max min))
   (let ((n (length args)))
@@ -129,6 +130,15 @@
       ((string= name "JSON_GET")
        (check-function-arity name args 1 nil)
        (cons (dsl-op "JSON-GET") args))
+      ((member name '("DATE" "TIMESTAMP" "YEAR" "MONTH" "DAY" "HOUR" "MINUTE" "SECOND" "DOW") :test #'string=)
+       (check-function-arity name args 1)
+       (list (dsl-op name) (first args)))
+      ((member name '("DATE_TEXT" "TIMESTAMP_TEXT") :test #'string=)
+       (check-function-arity name args 1)
+       (list (dsl-op (substitute #\- #\_ name)) (first args)))
+      ((string= name "TODAY")
+       (check-function-arity name args 0)
+       (list (dsl-op "TODAY")))
       ((string= name "NOW")
        (check-function-arity name args 0)
        (list (dsl-op "FN") 'now))

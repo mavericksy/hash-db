@@ -22,6 +22,8 @@
     #:keep-history #:history #:with-as-of #:history-error
     ;; import and export
     #:export-csv #:import-csv #:export-json #:import-json #:import-error #:error-line
+    ;; dates
+    #:parse-timestamp #:format-timestamp #:format-date
     ;; json
     #:json #:json-encode #:json-decode #:json-error
     ;; changing tables and migrations

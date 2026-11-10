@@ -271,7 +271,7 @@
     ("TEXT" . string) ("VARCHAR" . string) ("CHAR" . string) ("CHARACTER" . string)
     ("STRING" . string) ("CLOB" . string)
     ("BOOLEAN" . boolean) ("BOOL" . boolean)
-    ("TIMESTAMP" . timestamp) ("DATETIME" . timestamp)
+    ("TIMESTAMP" . timestamp) ("DATETIME" . timestamp) ("DATE" . timestamp)
     ("JSON" . json) ("JSONB" . json) ("KEYWORD" . keyword) ("ANY" . any)))
 
 (defun sql-column-type (name)
