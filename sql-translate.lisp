@@ -31,30 +31,45 @@
         (prefixed-name (scope-entry-prefix entry) name)
         name)))
 
+;; The column of SCHEMA that a name in SQL means. SQL names have no hyphen, so pet_ref also
+;; finds the column PET-REF. An exact match comes first.
+(defun sql-find-column (name schema)
+  (or (find (as-keyword name) schema :key #'name)
+      (and (find #\_ name)
+           (find (as-keyword (substitute #\- #\_ name)) schema :key #'name))))
+
+;; Look for a column in SCOPE. Return (values entry column), or nil and :none or :ambiguous.
+(defun find-scope-column (scope qualifier name)
+  (progn
+    (if qualifier
+        (let* ((entry (find qualifier scope :key #'scope-entry-qualifier :test #'string-equal))
+               (column (and entry (sql-find-column name (scope-entry-schema entry)))))
+          (if column (values entry column) (values nil :none)))
+        (let ((matches (loop for entry in scope
+                             for column = (sql-find-column name (scope-entry-schema entry))
+                             when column collect (cons entry column))))
+          (cond ((null matches) (values nil :none))
+                ((rest matches) (values nil :ambiguous))
+                (t (values (car (first matches)) (cdr (first matches)))))))))
+
+;; The entry and the column that a name means in the scope. Signal sql-error if there is none.
+(defun resolve-column-entry (qualifier name)
+  (multiple-value-bind (entry column) (find-scope-column *scope* qualifier name)
+    (cond (entry (values entry column))
+          ((and qualifier (not (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)))
+           (sql-fail *sql-text* nil "Unknown table or alias ~A" qualifier))
+          (qualifier (sql-fail *sql-text* nil "Table ~A has no column ~A" qualifier name))
+          ((eq column :ambiguous)
+           (sql-fail *sql-text* nil "Column ~A is in more than one table. Write table.~A" name name))
+          (t (sql-fail *sql-text* nil "Unknown column ~A" name)))))
+
 ;; The keyword that names a column in the rows, for a (:col qualifier name) in the scope.
 (defun resolve-column (qualifier name)
-  (let ((column-name (as-keyword name)))
-    (cond
-      (qualifier
-       (let ((entry (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)))
-         (unless entry
-           (sql-fail *sql-text* nil "Unknown table or alias ~A" qualifier))
-         (let ((column (find column-name (scope-entry-schema entry) :key #'name)))
-           (unless column
-             (sql-fail *sql-text* nil "Table ~A has no column ~A" qualifier name))
-           (column-keyword entry column))))
-      ((find column-name *aliases*)
-       column-name)
-      (t
-       (let ((matches (loop for entry in *scope*
-                            for column = (find column-name (scope-entry-schema entry) :key #'name)
-                            when column collect (cons entry column))))
-         (cond ((null matches)
-                (sql-fail *sql-text* nil "Unknown column ~A" name))
-               ((rest matches)
-                (sql-fail *sql-text* nil "Column ~A is in more than one table. Write table.~A"
-                          name name))
-               (t (column-keyword (car (first matches)) (cdr (first matches))))))))))
+  (if (and (null qualifier) (find (as-keyword name) *aliases*)
+           (not (find-scope-column *scope* nil name)))
+      (as-keyword name)
+      (multiple-value-bind (entry column) (resolve-column-entry qualifier name)
+        (column-keyword entry column))))
 
 ;; A value from a parameter, as data an expression accepts as a constant.
 (defun param-datum (value)

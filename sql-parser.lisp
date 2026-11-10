@@ -278,6 +278,26 @@
                         (parse-name "an alias")))))
       (list name quoted alias))))
 
+;; A join is (kind table-reference condition) with kind :inner, :left, :right or :full.
+;; Return nil when the next words are not a join.
+(defun parse-join ()
+  (let ((kind (cond ((accept-word "INNER") :inner)
+                    ((accept-word "LEFT") (accept-word "OUTER") :left)
+                    ((accept-word "RIGHT") (accept-word "OUTER") :right)
+                    ((accept-word "FULL") (accept-word "OUTER") :full)
+                    ((or (at-word "CROSS") (at-word "NATURAL"))
+                     (parse-fail "~A JOIN is not supported. Use JOIN ... ON a = b" (string-upcase (token-value (tok)))))
+                    ((at-word "JOIN") :inner)
+                    (t nil))))
+    (when kind
+      (expect-word "JOIN")
+      (let ((table (parse-table-reference)))
+        (when (at-word "USING")
+          (parse-fail "USING is not supported. Use ON a.x = b.x"))
+        (unless (accept-word "ON")
+          (parse-fail "Expected ON. A join needs a condition"))
+        (list kind table (parse-expression))))))
+
 (defun parse-select ()
   (expect-word "SELECT")
   (when (or (at-word "UNION") (at-word "INTERSECT") (at-word "EXCEPT"))
@@ -288,6 +308,8 @@
     (unless (accept-word "FROM")
       (parse-fail "Expected FROM. A SELECT without a table is not supported"))
     (setf from (parse-table-reference))
+    (loop for join = (parse-join) while join do (push join joins))
+    (setf joins (nreverse joins))
     (when (accept-symbol ",")
       (parse-fail "A list of tables is not supported. Use JOIN ... ON"))
     (when (accept-word "WHERE") (setf where (parse-expression)))

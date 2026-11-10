@@ -52,7 +52,8 @@
                              (:file "history-tests")
                              (:file "sql-lexer-tests")
                              (:file "sql-expr-tests")
-                             (:file "sql-select-tests"))))
+                             (:file "sql-select-tests")
+                             (:file "sql-join-tests"))))
   :perform (test-op (o c)
              (let ((results (uiop:symbol-call :fiveam '#:run
                                               (uiop:find-symbol* '#:hash-db-suite :hash-db-tests))))

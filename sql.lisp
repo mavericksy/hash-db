@@ -38,10 +38,13 @@
       (sql-fail *sql-text* nil "~A must be a whole number, 0 or more" what))
     value))
 
-;; The item for a column of the scope, named as SQL names a result column.
+;; The item for a column of the scope, named as SQL names a result column: by the
+;; column name, or by table.column when two items would have the same name.
 (defun column-item (entry column duplicated)
   (let ((ref (column-keyword entry column)))
-    (cond ((eq ref (name column)) ref)
+    (cond ((eq ref (name column)) (if duplicated
+                                      (list (dsl-op "AS") ref (prefixed-name (scope-entry-qualifier entry) (name column)))
+                                      ref))
           (duplicated (list (dsl-op "AS") ref (prefixed-name (scope-entry-qualifier entry) (name column))))
           (t (list (dsl-op "AS") ref (name column))))))
 
@@ -53,20 +56,36 @@
         (list entry))
       *scope*))
 
+;; Return the :col list for the items, and the aliases that were given with AS.
 (defun translate-select-items (items)
-  "Return the :col list, and the list of alias keywords."
-  (let ((all-star-only (and (null (rest items)) (eq (first (first items)) :star))))
-    (if all-star-only
-        (values t nil)
-        (let ((translated '()) (aliases '()))
-          (dolist (item items)
-            (ecase (first item)
-              (:star
-               (dolist (entry (scope-entries-for (second item)))
-                 (dolist (column (scope-entry-schema entry))
-                   (push (column-item entry column nil) translated))))
+  (if (and (null (rest items)) (eq (first (first items)) :star) (null (second (first items)))
+           (null (rest *scope*)))
+      (values t nil)
+      (let ((records '()))
+        ;; first find what each item is, so that a repeated column name can be seen
+        (dolist (item items)
+          (ecase (first item)
+            (:star (dolist (entry (scope-entries-for (second item)))
+                     (dolist (column (scope-entry-schema entry))
+                       (push (list :plain entry column) records))))
+            (:expr
+             (destructuring-bind (tree alias) (rest item)
+               (if (and (null alias) (eq (first tree) :col))
+                   (multiple-value-bind (entry column) (resolve-column-entry (second tree) (third tree))
+                     (push (list :plain entry column) records))
+                   (push (list :expr tree alias) records))))))
+        (setf records (nreverse records))
+        (let ((names (loop for record in records
+                           when (eq (first record) :plain) collect (name (third record))))
+              (translated '())
+              (aliases '()))
+          (dolist (record records)
+            (ecase (first record)
+              (:plain
+               (destructuring-bind (entry column) (rest record)
+                 (push (column-item entry column (> (count (name column) names) 1)) translated)))
               (:expr
-               (destructuring-bind (tree alias) (rest item)
+               (destructuring-bind (tree alias) (rest record)
                  (let ((expr (translate-expression tree)))
                    (cond (alias
                           (let ((key (as-keyword alias)))
@@ -85,16 +104,70 @@
           (list* (dsl-op (if (eq direction :desc) "DESC" "ASC")) expr
                  (and nulls (list :nulls nulls)))))))
 
+;;; Joins
+
+;; Check that a side of an ON names a column that exists somewhere. An unqualified name
+;; that is in two tables is fine here. The caller says what it means.
+(defun resolve-column-entry-or-either (side)
+  (destructuring-bind (qualifier name) (rest side)
+    (multiple-value-bind (entry column) (find-scope-column *scope* qualifier name)
+      (declare (ignore entry))
+      (when (and (not (typep column 'column)) (not (eq column :ambiguous)))
+        (resolve-column-entry qualifier name)))))
+
+;; The two columns of an ON condition, as (here there): HERE names a column of the tables
+;; so far, as the rows name it, and THERE names a column of the new table.
+(defun resolve-join-condition (on entry)
+  (unless (and (eq (first on) :op) (string= (second on) "=")
+               (eq (first (third on)) :col) (eq (first (fourth on)) :col))
+    (sql-fail *sql-text* nil "ON must be one equality between two columns, such as ON a.x = b.y"))
+  ;; a name that is nowhere gets its own message
+  (let ((*scope* (append *scope* (list entry))))
+    (dolist (side (list (third on) (fourth on)))
+      (resolve-column-entry-or-either side)))
+  (flet ((earlier (side)
+           (multiple-value-bind (e c) (find-scope-column *scope* (second side) (third side))
+             (and e (column-keyword e c))))
+         (new (side)
+           (multiple-value-bind (e c) (find-scope-column (list entry) (second side) (third side))
+             (and e (name c)))))
+    (let ((a (third on)) (b (fourth on)))
+      (dolist (side (list a b))
+        (when (and (null (second side)) (earlier side) (new side))
+          (sql-fail *sql-text* nil "Column ~A is in more than one table. Write table.~A"
+                    (third side) (third side))))
+      (cond ((and (earlier a) (new b)) (values (earlier a) (new b)))
+            ((and (earlier b) (new a)) (values (earlier b) (new a)))
+            (t (sql-fail *sql-text* nil "ON must compare a column of the tables before ~A with a column of ~A"
+                         (scope-entry-qualifier entry) (scope-entry-qualifier entry)))))))
+
+;; Add the joins to *scope* one by one, and return the :joins list for select.
+(defun translate-joins (join-trees)
+  (let ((joins '()))
+    (dolist (join join-trees)
+      (destructuring-bind (kind (text quoted alias) on) join
+        (let* ((table-name (sql-table-name text quoted))
+               (table (find-table table-name))
+               (qualifier (or alias text))
+               (entry (make-scope-entry qualifier table-name (schema table) qualifier)))
+          (when (find qualifier *scope* :key #'scope-entry-qualifier :test #'string-equal)
+            (sql-fail *sql-text* nil "Two tables are called ~A. Give one an alias" qualifier))
+          (multiple-value-bind (here there) (resolve-join-condition on entry)
+            (push (list kind table-name here there :as qualifier) joins))
+          (setf *scope* (append *scope* (list entry))))))
+    (nreverse joins)))
+
 ;; The arguments of select for a SELECT tree.
 (defun translate-select (ast)
   (destructuring-bind (&key distinct items from joins where group having order limit offset) (rest ast)
-    (declare (ignore joins))
     (destructuring-bind (table-text quoted alias) from
       (let* ((table-name (sql-table-name table-text quoted))
              (table (find-table table-name))
              (*scope* (list (make-scope-entry (or alias table-text) table-name (schema table) nil)))
              (*aliases* nil)
-             (plist (list :from table-name)))
+             (plist (list :from table-name))
+             (join-args (translate-joins joins)))
+        (when join-args (setf (getf plist :joins) join-args))
         (multiple-value-bind (col aliases) (translate-select-items items)
           (setf (getf plist :col) col)
           (when distinct (setf (getf plist :distinct) t))
